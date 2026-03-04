@@ -9,9 +9,11 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import re
 import secrets
 import smtplib
+import uuid
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from html import escape
@@ -45,6 +47,8 @@ AUDIT_DIR = Path("data/audit")
 OUTBOX_DIR = Path("data/outbox")
 REG_UPDATES_FILE = Path("data/regulatory_updates.json")
 SCHEDULE_DIR = Path("data/schedules")
+GEO_DIR = Path("data/geo")
+ASSET_STATUS_DIR = Path("data/assets_status")
 OFFERS_DIR = Path("data/offers")
 TASKS_DIR = Path("data/tasks")
 PORTAL_DIR = Path("data/portal")
@@ -186,8 +190,30 @@ def save_auth(auth: dict) -> None:
     AUTH_FILE.write_text(json.dumps(auth, indent=2), encoding="utf-8")
 
 
-def parse_csv_rows(text: str) -> list[dict[str, str]]:
-    return [dict(r) for r in csv.DictReader(io.StringIO(text.strip()))]
+def parse_csv_rows(text: str, delimiter: str = ",") -> list[dict[str, str]]:
+    content = text.strip()
+    if not content:
+        return []
+    return [dict(r) for r in csv.DictReader(io.StringIO(content), delimiter=delimiter)]
+
+
+def sanitize_csv_delimiter(raw: str) -> str:
+    mapping = {",": ",", ";": ";", "\t": "\t", "tab": "\t"}
+    return mapping.get(raw, ",")
+
+
+def csv_preview_rows(text: str, delimiter: str = ",", limit: int = 10) -> tuple[list[str], list[dict[str, str]]]:
+    content = text.strip()
+    if not content:
+        return [], []
+    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+    headers = list(reader.fieldnames or [])
+    rows = []
+    for idx, row in enumerate(reader):
+        if idx >= limit:
+            break
+        rows.append(dict(row))
+    return headers, rows
 
 
 def write_audit(tenant: str, actor: str, role: str, action: str, details: dict) -> None:
@@ -574,31 +600,286 @@ def suggest_asset_from_photo(photo_ref: str) -> tuple[str, str]:
     return "Maschine", "TRBS"
 
 
-def generate_route_plan(platform) -> list[dict[str, str]]:
-    inspectors = [u.user_id for u in platform.users.values() if u.role.value in {"pruefer", "admin"}]
-    if not inspectors:
-        inspectors = ["admin"]
-    due = []
+def load_geo_cache(tenant: str) -> dict[str, dict]:
+    return load_json_file(GEO_DIR / f"{tenant}.json", {})
+
+
+def save_geo_cache(tenant: str, cache: dict[str, dict]) -> None:
+    save_json_file(GEO_DIR / f"{tenant}.json", cache)
+
+
+def geocode_address(address: str, tenant: str, geo_cache: dict[str, dict] | None = None) -> tuple[float, float] | None:
+    needle = address.strip().lower()
+    if not needle:
+        return None
+    cache = geo_cache if geo_cache is not None else load_geo_cache(tenant)
+    for entry in cache.values():
+        if str(entry.get("address", "")).strip().lower() == needle:
+            lat = entry.get("lat")
+            lng = entry.get("lng")
+            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                return float(lat), float(lng)
+    return None
+
+
+def parse_lat_lng(raw: str) -> tuple[float, float] | None:
+    match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", raw or "")
+    if not match:
+        return None
+    lat = float(match.group(1))
+    lng = float(match.group(2))
+    if lat < -90 or lat > 90 or lng < -180 or lng > 180:
+        return None
+    return lat, lng
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def filter_assets_in_radius(start_latlng: tuple[float, float], assets_with_coords: list[dict], radius_km: float) -> list[dict]:
+    start_lat, start_lng = start_latlng
+    out = []
+    for item in assets_with_coords:
+        distance = haversine_km(start_lat, start_lng, float(item["lat"]), float(item["lng"]))
+        if distance <= radius_km:
+            copy_item = dict(item)
+            copy_item["distance_km"] = distance
+            out.append(copy_item)
+    out.sort(key=lambda x: float(x["distance_km"]))
+    return out
+
+
+def cluster_into_tours_nearest_neighbor(start_latlng: tuple[float, float], stops: list[dict], max_stops: int) -> list[list[dict]]:
+    if not stops:
+        return []
+    max_count = max(1, max_stops)
+    remaining = [dict(s) for s in stops]
+    tours: list[list[dict]] = []
+    while remaining:
+        tour: list[dict] = []
+        cur_lat, cur_lng = start_latlng
+        while remaining and len(tour) < max_count:
+            idx, stop = min(
+                enumerate(remaining),
+                key=lambda pair: haversine_km(cur_lat, cur_lng, float(pair[1]["lat"]), float(pair[1]["lng"])),
+            )
+            chosen = remaining.pop(idx)
+            chosen["distance_km"] = haversine_km(cur_lat, cur_lng, float(chosen["lat"]), float(chosen["lng"]))
+            tour.append(chosen)
+            cur_lat, cur_lng = float(chosen["lat"]), float(chosen["lng"])
+        tours.append(tour)
+    return tours
+
+
+def resolve_start_latlng(start_location: str, platform, tenant: str, geo_cache: dict[str, dict]) -> tuple[float, float] | None:
+    direct = parse_lat_lng(start_location)
+    if direct:
+        return direct
+    needle = start_location.strip().lower()
+    for asset in platform.assets.values():
+        if asset.location.strip().lower() == needle:
+            entry = geo_cache.get(asset.asset_id, {})
+            lat = entry.get("lat")
+            lng = entry.get("lng")
+            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                return float(lat), float(lng)
+    return geocode_address(start_location, tenant, geo_cache)
+
+
+def generate_route_plan(platform, tenant: str | None = None, start_location: str = "", radius_km: float = 20.0, max_stops: int = 8) -> list[dict[str, str]]:
+    if tenant is None or not start_location.strip():
+        inspectors = [u.user_id for u in platform.users.values() if u.role.value in {"pruefer", "admin"}]
+        if not inspectors:
+            inspectors = ["admin"]
+        due = []
+        today = date.today()
+        for plan in platform.plans.values():
+            due_date = plan.next_due_date()
+            days = (due_date - today).days
+            if days <= 30:
+                asset = platform.assets[plan.asset_id]
+                due.append((asset.location, due_date, plan.plan_id, asset.name))
+        due.sort(key=lambda x: (x[0], x[1]))
+        route = []
+        for idx, item in enumerate(due):
+            route.append(
+                {
+                    "inspector": inspectors[idx % len(inspectors)],
+                    "location": item[0],
+                    "due_date": item[1].isoformat(),
+                    "plan_id": item[2],
+                    "asset": item[3],
+                }
+            )
+        return route
+
+    geo_cache = load_geo_cache(tenant)
+    start = resolve_start_latlng(start_location, platform, tenant, geo_cache)
+    if not start:
+        raise ValueError("Startpunkt konnte nicht geokodiert werden. Nutze 'lat,lng' oder einen bekannten Asset-Standort mit Koordinaten.")
+
+    inspectors = [u.user_id for u in platform.users.values() if u.role.value in {"pruefer", "admin"}] or ["admin"]
+    due_stops = []
     today = date.today()
     for plan in platform.plans.values():
         due_date = plan.next_due_date()
-        days = (due_date - today).days
-        if days <= 30:
-            asset = platform.assets[plan.asset_id]
-            due.append((asset.location, due_date, plan.plan_id, asset.name))
-    due.sort(key=lambda x: (x[0], x[1]))
-    route = []
-    for idx, item in enumerate(due):
-        route.append(
-            {
-                "inspector": inspectors[idx % len(inspectors)],
-                "location": item[0],
-                "due_date": item[1].isoformat(),
-                "plan_id": item[2],
-                "asset": item[3],
-            }
-        )
+        if (due_date - today).days > 30:
+            continue
+        asset = platform.assets.get(plan.asset_id)
+        if not asset:
+            continue
+        geo = geo_cache.get(asset.asset_id, {})
+        lat = geo.get("lat")
+        lng = geo.get("lng")
+        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            due_stops.append({
+                "asset_id": asset.asset_id,
+                "asset": asset.name,
+                "location": asset.location,
+                "plan_id": plan.plan_id,
+                "due_date": due_date.isoformat(),
+                "lat": float(lat),
+                "lng": float(lng),
+                "geo_status": "geocoded",
+            })
+
+    in_radius = filter_assets_in_radius(start, due_stops, float(radius_km))
+    tours = cluster_into_tours_nearest_neighbor(start, in_radius, max_stops)
+    route: list[dict[str, str]] = []
+    idx = 0
+    for tour in tours:
+        for stop in tour:
+            route.append(
+                {
+                    "inspector": inspectors[idx % len(inspectors)],
+                    "location": stop["location"],
+                    "asset": stop["asset"],
+                    "due_date": stop["due_date"],
+                    "plan_id": stop["plan_id"],
+                    "distance_km": f"{float(stop.get('distance_km', 0.0)):.1f}",
+                    "geo_status": stop.get("geo_status", "missing"),
+                }
+            )
+            idx += 1
     return route
+
+
+def load_asset_status(tenant: str) -> dict[str, dict]:
+    return load_json_file(ASSET_STATUS_DIR / f"{tenant}.json", {})
+
+
+def save_asset_status(tenant: str, payload: dict[str, dict]) -> None:
+    save_json_file(ASSET_STATUS_DIR / f"{tenant}.json", payload)
+
+
+def archive_asset(tenant: str, asset_id: str) -> None:
+    status = load_asset_status(tenant)
+    status[asset_id] = {"status": "archived", "archived_at": datetime.utcnow().isoformat(timespec="seconds")}
+    save_asset_status(tenant, status)
+
+
+def activate_asset(tenant: str, asset_id: str) -> None:
+    status = load_asset_status(tenant)
+    if asset_id in status:
+        status.pop(asset_id, None)
+        save_asset_status(tenant, status)
+
+
+def asset_has_dependencies(platform, asset_id: str) -> bool:
+    related_plan_ids = {plan.plan_id for plan in platform.plans.values() if plan.asset_id == asset_id}
+    if related_plan_ids:
+        return True
+    related_record_ids = {rec.record_id for rec in platform.records.values() if rec.plan_id in related_plan_ids}
+    if related_record_ids:
+        return True
+    return any(any(rid in related_record_ids for rid in inv.source_record_ids) for inv in platform.invoices.values())
+
+
+def invalidate_asset_geo_if_location_changed(tenant: str, asset_id: str, old_location: str, new_location: str) -> None:
+    if old_location.strip() == new_location.strip():
+        return
+    geo_cache = load_geo_cache(tenant)
+    if asset_id in geo_cache:
+        geo_cache[asset_id] = {
+            "lat": None,
+            "lng": None,
+            "address": new_location,
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+        save_geo_cache(tenant, geo_cache)
+
+
+def generate_temp_password(length: int = 12) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(max(8, length)))
+
+
+def invalidate_user_sessions(tenant: str, user_id: str) -> int:
+    to_remove = [token for token, sess in SESSIONS.items() if sess.get("tenant") == tenant and sess.get("user_id") == user_id]
+    for token in to_remove:
+        SESSIONS.pop(token, None)
+    return len(to_remove)
+
+
+def validate_import_rows(kind: str, rows: list[dict[str, str]], platform) -> list[str]:
+    errors: list[str] = []
+    if not rows:
+        return ["Keine CSV-Zeilen erkannt."]
+    if kind == "assets":
+        required = ["asset_id", "name", "serial_number", "location", "asset_type"]
+        seen = set()
+        for idx, row in enumerate(rows, start=2):
+            for field_name in required:
+                if not str(row.get(field_name, "")).strip():
+                    errors.append(f"Zeile {idx}: Pflichtfeld '{field_name}' fehlt")
+            aid = str(row.get("asset_id", "")).strip()
+            if aid in seen:
+                errors.append(f"Zeile {idx}: Doppelte asset_id '{aid}' in CSV")
+            if aid in platform.assets:
+                errors.append(f"Zeile {idx}: asset_id '{aid}' existiert bereits")
+            seen.add(aid)
+    else:
+        required = ["plan_id", "asset_id", "regulation", "interval_days"]
+        seen = set()
+        for idx, row in enumerate(rows, start=2):
+            for field_name in required:
+                if not str(row.get(field_name, "")).strip():
+                    errors.append(f"Zeile {idx}: Pflichtfeld '{field_name}' fehlt")
+            pid = str(row.get("plan_id", "")).strip()
+            if pid in seen:
+                errors.append(f"Zeile {idx}: Doppelte plan_id '{pid}' in CSV")
+            if pid in platform.plans:
+                errors.append(f"Zeile {idx}: plan_id '{pid}' existiert bereits")
+            aid = str(row.get("asset_id", "")).strip()
+            if aid and aid not in platform.assets:
+                errors.append(f"Zeile {idx}: asset_id '{aid}' existiert nicht")
+            try:
+                int(str(row.get("interval_days", "")))
+            except ValueError:
+                errors.append(f"Zeile {idx}: interval_days muss eine Zahl sein")
+            seen.add(pid)
+    return errors
+
+
+def apply_import_rows(kind: str, rows: list[dict[str, str]], platform) -> tuple[int, int]:
+    created_assets = 0
+    created_plans = 0
+    if kind == "assets":
+        for row in rows:
+            platform.add_asset(Asset(row["asset_id"], row["name"], row["serial_number"], row["location"], row["asset_type"]))
+            created_assets += 1
+    else:
+        for row in rows:
+            platform.add_plan(InspectionPlan(row["plan_id"], row["asset_id"], row["regulation"], int(row["interval_days"])))
+            created_plans += 1
+    return created_assets, created_plans
 
 
 def create_due_offer(platform, horizon_days: int = 30) -> dict:
@@ -1045,6 +1326,42 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if parsed.path == "/export-assets-csv":
+            if not self.require_capability("import_export"):
+                self.send_error(403)
+                return
+            cur = self.current()
+            platform = storage.load(cur["tenant"])
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["Asset-ID", "Anlagenname", "Seriennummer", "Standort", "Anlagentyp"], delimiter=";")
+            writer.writeheader()
+            for asset in platform.assets.values():
+                writer.writerow({"Asset-ID": asset.asset_id, "Anlagenname": asset.name, "Seriennummer": asset.serial_number, "Standort": asset.location, "Anlagentyp": asset.asset_type})
+            data = buf.getvalue().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if parsed.path == "/export-plans-csv":
+            if not self.require_capability("import_export"):
+                self.send_error(403)
+                return
+            cur = self.current()
+            platform = storage.load(cur["tenant"])
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=["Plan-ID", "Asset-ID", "Regelwerk", "Intervall (Tage)"], delimiter=";")
+            writer.writeheader()
+            for plan in platform.plans.values():
+                writer.writerow({"Plan-ID": plan.plan_id, "Asset-ID": plan.asset_id, "Regelwerk": plan.regulation, "Intervall (Tage)": plan.interval_days})
+            data = buf.getvalue().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if parsed.path == "/export-datev":
             if not self.require_capability("import_export"):
                 self.send_error(403)
@@ -1101,19 +1418,19 @@ class Handler(BaseHTTPRequestHandler):
             tab = "dashboard"
 
         if tab == "users":
-            self.respond(page("Benutzer", banner + self.users_page(cur, platform), "users", role=cur["role"]))
+            self.respond(page("Benutzer", banner + self.users_page(cur, platform), "users", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "automation":
-            self.respond(page("Automationen", banner + self.automation_page(cur, platform, auto_page), "automation", role=cur["role"]))
+            self.respond(page("Automationen", banner + self.automation_page(cur, platform, auto_page), "automation", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "assets":
-            self.respond(page("Anlagen", banner + self.assets_page(platform), "assets", role=cur["role"]))
+            self.respond(page("Anlagen", banner + self.assets_page(cur, platform), "assets", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "records":
-            self.respond(page("Prüfungen", banner + self.records_page(cur, platform), "records", role=cur["role"]))
+            self.respond(page("Prüfungen", banner + self.records_page(cur, platform), "records", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "imports":
-            self.respond(page("Import/Export", banner + self.imports_page(cur), "imports", role=cur["role"]))
+            self.respond(page("Import/Export", banner + self.imports_page(cur), "imports", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "ai":
-            self.respond(page("AI-Assistent", banner + self.ai_page(cur, platform), "ai", role=cur["role"]))
+            self.respond(page("AI-Assistent", banner + self.ai_page(cur, platform), "ai", role=cur["role"], csrf_token=cur.get("csrf", "")))
         elif tab == "help":
-            self.respond(page("Hilfe", banner + self.help_page(), "help", role=cur["role"]))
+            self.respond(page("Hilfe", banner + self.help_page(), "help", role=cur["role"], csrf_token=cur.get("csrf", "")))
         else:
             self.respond(page("Dashboard", banner + self.dashboard_page(cur, platform), "dashboard", role=cur["role"], csrf_token=cur.get("csrf","")))
 
@@ -1129,6 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
       <label for='role'>Rolle</label>
       <select id='role' name='role' required>
         <option value='owner'>Owner/Admin</option>
+        <option value='admin'>Admin</option>
         <option value='disposition'>Disposition</option>
         <option value='pruefer'>Prüfer</option>
         <option value='buchhaltung'>Buchhaltung</option>
@@ -1308,7 +1626,9 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 
     def automation_page(self, cur: dict, platform, auto_page: str = "overview") -> str:
         tenant = cur["tenant"]
-        route = load_json_file(SCHEDULE_DIR / f"{tenant}.json", {}).get("route", [])
+        schedule_data = load_json_file(SCHEDULE_DIR / f"{tenant}.json", {})
+        route = schedule_data.get("route", [])
+        geo_cache = load_geo_cache(tenant)
         offer = load_json_file(OFFERS_DIR / f"{tenant}.json", {})
         tasks = load_json_file(TASKS_DIR / f"{tenant}.json", [])
         portal_items = load_json_file(PORTAL_DIR / f"{tenant}.json", [])
@@ -1324,9 +1644,10 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
         red_explain = explain_red_items(platform)
 
         route_rows = "".join(
-            f"<tr><td>{escape(item['inspector'])}</td><td>{escape(item['location'])}</td><td>{escape(item['asset'])}</td><td>{escape(item['due_date'])}</td></tr>"
+            f"<tr><td>{escape(item['inspector'])}</td><td>{escape(item['location'])}</td><td>{escape(item['asset'])}</td><td>{escape(item['due_date'])}</td><td>{escape(str(item.get('distance_km','-')))}</td><td>{escape(item.get('geo_status','missing'))}</td></tr>"
             for item in route[:20]
-        ) or "<tr><td colspan='4'>Noch keine Tourplanung erzeugt.</td></tr>"
+        ) or "<tr><td colspan='6'>Noch keine Tourplanung erzeugt.</td></tr>"
+        missing_geo_assets = [a for a in platform.assets.values() if not isinstance(geo_cache.get(a.asset_id, {}).get('lat'), (int, float))]
 
         dunning_rows = "".join(
             f"<tr><td>{escape(item['invoice_id'])}</td><td>{escape(item['customer'])}</td><td>{escape(item['late_days'])}</td><td>{escape(item['level'])}</td></tr>"
@@ -1385,12 +1706,16 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 <div class='card'>
   <h3>Terminierung & Disposition</h3>
   <form method='post' action='/run-auto-schedule'>
-    {label_input('Planungsdatum', 'planning_date', date.today().isoformat(), 'date', date.today().isoformat())}
-    {label_input('Region / PLZ-Bereich', 'region_filter', 'z. B. 40***')}
-    {label_input('Max. Stops pro Tour', 'max_stops', '8', 'number', '8')}
+    {label_input('Planungsdatum', 'planning_date', date.today().isoformat(), 'date', schedule_data.get('planning_date', date.today().isoformat()))}
+    {label_input('Startpunkt', 'start_location', 'Adresse oder lat,lng', value=schedule_data.get('start_location', ''))}
+    {label_input('Radius (km)', 'radius_km', '20', 'number', str(schedule_data.get('radius_km', 20)))}
+    {label_input('Modus', 'mode', 'km', value=schedule_data.get('mode', 'km'))}
+    {label_input('Max. Stops pro Tour', 'max_stops', '8', 'number', str(schedule_data.get('max_stops', 8)))}
     <div class='field'><button type='submit'>Touren erzeugen</button></div>
   </form>
-  <div class='table-wrap'><table><tr><th>Prüfer</th><th>Standort</th><th>Asset</th><th>Fällig</th></tr>{route_rows}</table></div>
+  <p class='muted'><a href='/?page=automation&auto=scheduling&msg=Beispiel%3A+Startpunkt+als+lat%2Clng+angeben+%28z.+B.+52.52%2C13.40%29&kind=ok'>Beispiel: Startpunkt setzen</a></p>
+  <div class='table-wrap'><table><tr><th>Prüfer</th><th>Standort</th><th>Asset</th><th>Fällig</th><th>Entfernung_km</th><th>Geo-Status</th></tr>{route_rows}</table></div>
+  <p class='muted'>Warnung: {len(missing_geo_assets)} Anlagen ohne Koordinaten im Geo-Cache.</p>
 </div>
 """
 
@@ -1480,7 +1805,7 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   <h3>Übersicht</h3>
   <p class='muted'>Wähle oben einen Automations-Bereich. So bleiben Eingaben und Aktionen übersichtlich pro Arbeitsschritt.</p>
   <div class='grid'>
-    <div class='card'><h4>Touren</h4><div class='table-wrap'><table><tr><th>Prüfer</th><th>Standort</th><th>Asset</th><th>Fällig</th></tr>{route_rows}</table></div></div>
+    <div class='card'><h4>Touren</h4><div class='table-wrap'><table><tr><th>Prüfer</th><th>Standort</th><th>Asset</th><th>Fällig</th><th>Entfernung_km</th><th>Geo-Status</th></tr>{route_rows}</table></div></div>
     <div class='card'><h4>Mahnfälle</h4><div class='table-wrap'><table><tr><th>Rechnung</th><th>Kunde</th><th>Tage</th><th>Level</th></tr>{dunning_rows}</table></div></div>
   </div>
 </div>
@@ -1511,7 +1836,10 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 <div class='card'>
   <form method='post' action='/user-reset-password'>
     {label_input('Benutzer-ID', 'user_id', 'z. B. pruefer1')}
-    {label_input('Neues Passwort', 'new_password', '', 'password')}
+    {label_input('Neues Passwort (optional)', 'new_password', '', 'password')}
+    {label_input('Admin-Passwort (Re-Auth)', 'admin_password', '', 'password')}
+    <div class='field'><label for='temp_password'>Temporäres Passwort generieren?</label><select id='temp_password' name='temp_password'><option value='false'>Nein</option><option value='true'>Ja</option></select></div>
+    <div class='field'><label for='send_reset_link'>Reset-Link senden?</label><select id='send_reset_link' name='send_reset_link'><option value='false'>Nein</option><option value='true'>Ja</option></select></div>
     <div class='field'><button type='submit'>Passwort zurücksetzen</button></div>
   </form>
   <form method='post' action='/user-delete'>
@@ -1522,11 +1850,36 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 <div class='card table-wrap'><table><tr><th>User-ID</th><th>Name</th><th>Rolle</th><th>E-Mail</th></tr>{rows}</table></div>
 """
 
-    def assets_page(self, platform) -> str:
+    def assets_page(self, cur: dict, platform) -> str:
+        query = parse_qs(urlparse(self.path).query)
+        edit_asset_id = query.get("edit_asset", [""])[0]
+        show_archived = query.get("show_archived", ["0"])[0] == "1"
+        status = load_asset_status(cur["tenant"])
+
+        edit_asset = platform.assets.get(edit_asset_id) if edit_asset_id else None
+        rows = []
+        for asset in platform.assets.values():
+            state = status.get(asset.asset_id, {}).get("status", "active")
+            if state == "archived" and not show_archived:
+                continue
+            rows.append(
+                f"<tr><td>{escape(asset.asset_id)}</td><td>{escape(asset.name)}</td><td>{escape(asset.serial_number)}</td><td>{escape(asset.location)}</td><td>{escape(asset.asset_type)}</td><td>{escape(state)}</td><td>"
+                f"<a class='tab' href='/?page=assets&edit_asset={escape(asset.asset_id)}'>Bearbeiten</a> "
+                f"<form style='display:inline' method='post' action='/asset-archive'><input type='hidden' name='asset_id' value='{escape(asset.asset_id)}'><button class='secondary' type='submit'>Archivieren</button></form> "
+                f"<form style='display:inline' method='post' action='/asset-delete'><input type='hidden' name='asset_id' value='{escape(asset.asset_id)}'><button class='secondary' type='submit'>Löschen</button></form>"
+                "</td></tr>"
+            )
+        asset_rows = "".join(rows) or "<tr><td colspan='7'>Keine Anlagen vorhanden.</td></tr>"
+
+        plan_rows = "".join(
+            f"<tr><td>{escape(plan.plan_id)}</td><td>{escape(plan.asset_id)}</td><td>{escape(plan.regulation)}</td><td>{plan.interval_days}</td></tr>"
+            for plan in platform.plans.values()
+        ) or "<tr><td colspan='4'>Keine Prüfpläne vorhanden.</td></tr>"
+
         return f"""
 <div class='card'>
   <h2>Anlagen & Prüfpläne</h2>
-  {info_box('Was und warum?', 'Lege erst Anlagen, dann Prüfpläne an. Ohne Prüfplan keine fälligen Prüfungen.')}
+  {info_box('Was und warum?', 'Lege erst Anlagen, dann Prüfpläne an. Bearbeiten/Archivieren/Löschen sind jetzt direkt möglich.')}
   <form method='post' action='/add-asset-plan'>
     {label_input('Asset-ID', 'asset_id', 'a1')}
     {label_input('Anlagenname', 'asset_name', 'Schaltschrank A')}
@@ -1539,6 +1892,27 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
     <div class='field'><button type='submit'>Anlage + Plan speichern</button></div>
   </form>
 </div>
+<div class='card'>
+  <h3>Anlage bearbeiten</h3>
+  <form method='post' action='/asset-update'>
+    {label_input('Asset-ID', 'asset_id', 'a1', value=edit_asset.asset_id if edit_asset else '')}
+    {label_input('Anlagenname', 'asset_name', 'Schaltschrank A', value=edit_asset.name if edit_asset else '')}
+    {label_input('Seriennummer', 'serial', 'SN-001', value=edit_asset.serial_number if edit_asset else '')}
+    {label_input('Standort', 'location', 'Werk 1', value=edit_asset.location if edit_asset else '')}
+    {label_input('Anlagentyp', 'asset_type', 'Elektroanlage', value=edit_asset.asset_type if edit_asset else '')}
+    <div class='field'><button class='secondary' type='submit'>Änderungen speichern</button></div>
+  </form>
+  <form method='post' action='/plan-update'>
+    {label_input('Plan-ID', 'plan_id', 'p1')}
+    {label_input('Asset-ID', 'asset_id', 'a1')}
+    {label_input('Regelwerk', 'regulation', 'DGUV V3')}
+    {label_input('Intervall (Tage)', 'interval_days', '180', 'number', '180')}
+    <div class='field'><button class='secondary' type='submit'>Prüfplan aktualisieren</button></div>
+  </form>
+  <p><a href='/?page=assets&show_archived={1 if not show_archived else 0}'>{'Archiv anzeigen' if not show_archived else 'Archiv ausblenden'}</a></p>
+</div>
+<div class='card table-wrap'><h3>Anlagen</h3><table><tr><th>ID</th><th>Name</th><th>Seriennummer</th><th>Standort</th><th>Typ</th><th>Status</th><th>Aktionen</th></tr>{asset_rows}</table></div>
+<div class='card table-wrap'><h3>Prüfpläne</h3><table><tr><th>Plan-ID</th><th>Asset-ID</th><th>Regelwerk</th><th>Intervall</th></tr>{plan_rows}</table></div>
 """
 
     def records_page(self, cur: dict, platform) -> str:
@@ -1575,26 +1949,48 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 """
 
     def imports_page(self, cur: dict) -> str:
+        preview = cur.get("import_preview") or {}
+        preview_headers = preview.get("headers", [])
+        preview_rows = preview.get("rows", [])
+        preview_kind = preview.get("kind", "assets")
+        preview_delimiter = preview.get("delimiter", ",")
+        csv_text = preview.get("csv_text", "")
+        header_opt = preview.get("has_header", "true")
+        header_html = "".join(f"<th>{escape(h)}</th>" for h in preview_headers)
+        body_html = "".join("<tr>" + "".join(f"<td>{escape(str(r.get(h,'')))}</td>" for h in preview_headers) + "</tr>" for r in preview_rows)
+        preview_table = f"<div class='table-wrap'><table><tr>{header_html}</tr>{body_html}</table></div>" if preview_headers else "<p class='muted'>Noch keine Preview berechnet.</p>"
         return f"""
 <div class='card'>
   <h2>Import / Export / Hilfsoptionen</h2>
-  {info_box('Was und warum?', 'Mit CSV kannst du schnell viele Daten laden; mit DATEV und PDF exportierst du Ergebnisse.')}
+  {info_box('Was und warum?', 'Wizard-Light für CSV-Import mit Preview, Validierung und transaktionaler Verarbeitung.')}
+  <h3>Step 1: CSV laden & Preview</h3>
+  <form method='post' action='/import-preview'>
+    <div class='field'><label for='kind'>CSV-Typ</label><select id='kind' name='kind' required><option value='assets' {'selected' if preview_kind=='assets' else ''}>Assets</option><option value='plans' {'selected' if preview_kind=='plans' else ''}>Prüfpläne</option></select></div>
+    <div class='field'><label for='delimiter'>Delimiter</label><select id='delimiter' name='delimiter'><option value=',' {"selected" if preview_delimiter=="," else ""}>,</option><option value=';' {"selected" if preview_delimiter==";" else ""}>;</option><option value='	' {"selected" if preview_delimiter=="	" else ""}>Tab</option></select></div>
+    <div class='field'><label for='has_header'>Erste Zeile enthält Header?</label><select id='has_header' name='has_header'><option value='true' {'selected' if header_opt=='true' else ''}>Ja</option><option value='false' {'selected' if header_opt=='false' else ''}>Nein</option></select></div>
+    <div class='field' style='grid-column:1/-1'><label for='csv_text'>CSV-Inhalt</label><textarea id='csv_text' name='csv_text' placeholder='Header + Zeilen einfügen' required>{escape(csv_text)}</textarea></div>
+    <div class='field'><button type='submit'>Preview erstellen</button></div>
+  </form>
+  <h3>Step 2: Mapping</h3>
+  <p class='muted'>MVP: Bei passendem Header wird Mapping automatisch übernommen.</p>
+  {preview_table}
+  <h3>Step 3: Import ausführen</h3>
   <form method='post' action='/import-csv'>
-    <div class='field'><label for='kind'>CSV-Typ</label><select id='kind' name='kind' required><option value='assets'>Assets</option><option value='plans'>Prüfpläne</option></select></div>
-    <div class='field' style='grid-column:1/-1'><label for='csv_text'>CSV-Inhalt</label><textarea id='csv_text' name='csv_text' placeholder='Header + Zeilen einfügen' required></textarea></div>
+    <input type='hidden' name='kind' value='{escape(preview_kind)}'>
+    <input type='hidden' name='delimiter' value='{escape(preview_delimiter)}'>
+    <input type='hidden' name='has_header' value='{escape(header_opt)}'>
+    <input type='hidden' name='csv_text' value='{escape(csv_text, quote=True)}'>
     <div class='field'><button type='submit'>CSV importieren (Admin)</button></div>
   </form>
-  <div class='grid'>
-    <div class='card'>
-      <h4>Beispiel Assets</h4>
-      <pre>asset_id,name,serial_number,location,asset_type\na1,Schaltschrank A,SN-001,Werk 1,Elektroanlage</pre>
-    </div>
-    <div class='card'>
-      <h4>Beispiel Prüfpläne</h4>
-      <pre>plan_id,asset_id,regulation,interval_days\np1,a1,DGUV V3,180</pre>
-    </div>
-  </div>
-  <p><a href='/export-datev'>DATEV-CSV exportieren</a></p>
+  <p><button class='secondary' type='button' onclick="document.getElementById('csvExamples').showModal()">Beispiel anzeigen</button></p>
+  <dialog id='csvExamples'>
+    <h4>Beispiel Assets</h4><pre>asset_id;name;serial_number;location;asset_type
+a1;Schaltschrank A;SN-001;Werk 1;Elektroanlage</pre>
+    <h4>Beispiel Prüfpläne</h4><pre>plan_id;asset_id;regulation;interval_days
+p1;a1;DGUV V3;180</pre>
+    <form method='dialog'><button>Schließen</button></form>
+  </dialog>
+  <p><a href='/export-datev'>DATEV-CSV exportieren</a> | <a href='/export-assets-csv'>Assets CSV (Excel-freundlich)</a> | <a href='/export-plans-csv'>Pläne CSV (Excel-freundlich)</a></p>
 </div>
 <div class='card'>
   <form method='post' action='/pay-invoice'>
@@ -1806,7 +2202,11 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
         if not cur:
             self.redirect("/")
             return
-        if form.get("csrf", [""])[0] != cur.get("csrf", ""):
+        csrf_form = form.get("csrf", [""])[0]
+        csrf_cookie = cookies.SimpleCookie(self.headers.get("Cookie")).get("csrf_token")
+        csrf_cookie_value = csrf_cookie.value if csrf_cookie else ""
+        expected_csrf = cur.get("csrf", "")
+        if csrf_form != expected_csrf and csrf_cookie_value != expected_csrf:
             self.send_error(403)
             return
 
@@ -1856,12 +2256,32 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
                 if not self.require_capability("manage_users"):
                     self.send_error(403)
                     return
-                uid = form["user_id"][0]
-                for u in auth_data[cur["tenant"]]["users"]:
-                    if u["user_id"] == uid:
-                        u["password_hash"] = hash_password(form["new_password"][0])
+                uid = self.safe_form_value(form, "user_id")
+                admin_password = self.safe_form_value(form, "admin_password")
+                current_user = next((u for u in auth_data[cur["tenant"]]["users"] if u.get("user_id") == cur["user_id"]), None)
+                if not current_user or not verify_password(admin_password, current_user.get("password_hash", "")):
+                    write_audit(cur["tenant"], cur["user_id"], cur["role"], "admin_reauth_fail", {"target_user_id": uid})
+                    raise ValueError("Admin-Re-Auth fehlgeschlagen")
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "admin_reauth_success", {"target_user_id": uid})
+
+                is_temp = self.optional_form_value(form, "temp_password", "false") == "true"
+                send_link = self.optional_form_value(form, "send_reset_link", "false") == "true"
+                temp_password = generate_temp_password() if is_temp else ""
+                new_password = temp_password or self.safe_form_value(form, "new_password")
+                target = next((u for u in auth_data[cur["tenant"]]["users"] if u.get("user_id") == uid), None)
+                if not target:
+                    raise ValueError("Benutzer nicht gefunden")
+                target["password_hash"] = hash_password(new_password)
                 save_auth(auth_data)
-                write_audit(cur["tenant"], cur["user_id"], cur["role"], "user_reset_password", {"user_id": uid})
+                invalidated = invalidate_user_sessions(cur["tenant"], uid)
+                method = "temp" if is_temp else "manual"
+                if send_link:
+                    maybe_send_email(target.get("email", f"{uid}@{cur['tenant']}.local"), "Reset-Link", f"Reset-Link (MVP): https://{cur['tenant']}.local/reset/{secrets.token_urlsafe(16)}")
+                    method = "link"
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "user_password_reset", {"target_user_id": uid, "method": method, "invalidated_sessions": invalidated})
+                if is_temp:
+                    self.redirect_with_message(f"Temporäres Passwort (einmalig anzeigen): {temp_password}", page_name="users")
+                    return
 
             elif parsed.path == "/add-asset-plan":
                 if not self.require_capability("plan"):
@@ -1884,7 +2304,83 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
                         int(form["interval_days"][0]),
                     )
                 )
+                activate_asset(cur["tenant"], form["asset_id"][0])
+                geo_cache = load_geo_cache(cur["tenant"])
+                geo_cache.setdefault(form["asset_id"][0], {"lat": None, "lng": None, "address": form["location"][0], "updated_at": datetime.utcnow().isoformat(timespec="seconds")})
+                save_geo_cache(cur["tenant"], geo_cache)
                 write_audit(cur["tenant"], cur["user_id"], cur["role"], "add_asset_plan", {"asset_id": form["asset_id"][0]})
+
+            elif parsed.path == "/asset-update":
+                if not self.require_capability("plan"):
+                    self.send_error(403)
+                    return
+                asset_id = self.safe_form_value(form, "asset_id")
+                asset = platform.assets.get(asset_id)
+                if not asset:
+                    raise ValueError("Asset nicht gefunden")
+                before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                asset.name = self.safe_form_value(form, "asset_name")
+                asset.serial_number = self.safe_form_value(form, "serial")
+                new_location = self.safe_form_value(form, "location")
+                asset.asset_type = self.safe_form_value(form, "asset_type")
+                asset.location = new_location
+                invalidate_asset_geo_if_location_changed(cur["tenant"], asset_id, before["location"], new_location)
+                activate_asset(cur["tenant"], asset_id)
+                after = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "asset_update", {"asset_id": asset_id, "before": before, "after": after})
+                self.redirect_with_message("Anlage aktualisiert.", page_name="assets")
+                return
+
+            elif parsed.path == "/asset-archive":
+                if not self.require_capability("plan"):
+                    self.send_error(403)
+                    return
+                asset_id = self.safe_form_value(form, "asset_id")
+                before = load_asset_status(cur["tenant"]).get(asset_id, {"status": "active"})
+                archive_asset(cur["tenant"], asset_id)
+                after = load_asset_status(cur["tenant"]).get(asset_id, {"status": "archived"})
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "asset_archive", {"asset_id": asset_id, "before": before, "after": after})
+                self.redirect_with_message("Anlage archiviert.", page_name="assets")
+                return
+
+            elif parsed.path == "/asset-delete":
+                if not self.require_capability("plan"):
+                    self.send_error(403)
+                    return
+                asset_id = self.safe_form_value(form, "asset_id")
+                if asset_has_dependencies(platform, asset_id):
+                    raise ValueError("Löschen nicht möglich: abhängige Pläne/Records vorhanden. Bitte archivieren.")
+                before = None
+                if asset_id in platform.assets:
+                    asset = platform.assets[asset_id]
+                    before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                    platform.assets.pop(asset_id, None)
+                status = load_asset_status(cur["tenant"])
+                status.pop(asset_id, None)
+                save_asset_status(cur["tenant"], status)
+                geo_cache = load_geo_cache(cur["tenant"])
+                geo_cache.pop(asset_id, None)
+                save_geo_cache(cur["tenant"], geo_cache)
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "asset_delete", {"asset_id": asset_id, "before": before, "after": None})
+                self.redirect_with_message("Anlage gelöscht.", page_name="assets")
+                return
+
+            elif parsed.path == "/plan-update":
+                if not self.require_capability("plan"):
+                    self.send_error(403)
+                    return
+                plan_id = self.safe_form_value(form, "plan_id")
+                plan = platform.plans.get(plan_id)
+                if not plan:
+                    raise ValueError("Prüfplan nicht gefunden")
+                before = {"asset_id": plan.asset_id, "regulation": plan.regulation, "interval_days": plan.interval_days}
+                plan.asset_id = self.safe_form_value(form, "asset_id")
+                plan.regulation = self.safe_form_value(form, "regulation")
+                plan.interval_days = int(self.safe_form_value(form, "interval_days"))
+                after = {"asset_id": plan.asset_id, "regulation": plan.regulation, "interval_days": plan.interval_days}
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "plan_update", {"plan_id": plan_id, "before": before, "after": after})
+                self.redirect_with_message("Prüfplan aktualisiert.", page_name="assets")
+                return
 
             elif parsed.path == "/record-and-invoice":
                 if not self.require_capability("inspect"):
@@ -1939,34 +2435,38 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
                     save_json_file(PORTAL_DIR / f"{cur['tenant']}.json", portal_items)
                 write_audit(cur["tenant"], cur["user_id"], cur["role"], "record_and_invoice", {"record_id": record_id, "customer_signed": bool(customer_signature)})
 
+            elif parsed.path == "/import-preview":
+                if not self.require_capability("import_export"):
+                    self.send_error(403)
+                    return
+                delimiter = sanitize_csv_delimiter(self.optional_form_value(form, "delimiter", ","))
+                csv_text = self.safe_form_value(form, "csv_text")
+                kind = self.safe_form_value(form, "kind")
+                headers, preview_rows = csv_preview_rows(csv_text, delimiter=delimiter, limit=12)
+                cur["import_preview"] = {
+                    "headers": headers,
+                    "rows": preview_rows,
+                    "kind": kind,
+                    "delimiter": delimiter,
+                    "csv_text": csv_text,
+                    "has_header": self.optional_form_value(form, "has_header", "true"),
+                }
+                self.redirect_with_message(f"Preview erstellt ({len(preview_rows)} Zeilen).", page_name="imports")
+                return
+
             elif parsed.path == "/import-csv":
                 if not self.require_capability("import_export"):
                     self.send_error(403)
                     return
-                rows = parse_csv_rows(form["csv_text"][0])
+                delimiter = sanitize_csv_delimiter(self.optional_form_value(form, "delimiter", ","))
+                rows = parse_csv_rows(form["csv_text"][0], delimiter=delimiter)
                 kind = form["kind"][0]
-                if kind == "assets":
-                    for row in rows:
-                        platform.add_asset(
-                            Asset(
-                                row["asset_id"],
-                                row["name"],
-                                row["serial_number"],
-                                row["location"],
-                                row["asset_type"],
-                            )
-                        )
-                else:
-                    for row in rows:
-                        platform.add_plan(
-                            InspectionPlan(
-                                row["plan_id"],
-                                row["asset_id"],
-                                row["regulation"],
-                                int(row["interval_days"]),
-                            )
-                        )
-                write_audit(cur["tenant"], cur["user_id"], cur["role"], "import_csv", {"rows": len(rows), "kind": kind})
+                errors = validate_import_rows(kind, rows, platform)
+                if errors:
+                    raise ValueError("; ".join(errors[:8]))
+                created_assets, created_plans = apply_import_rows(kind, rows, platform)
+                batch_id = uuid.uuid4().hex[:12]
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "import_batch", {"batch_id": batch_id, "kind": kind, "rows": len(rows), "created_assets": created_assets, "created_plans": created_plans})
 
             elif parsed.path == "/pay-invoice":
                 if not self.require_capability("billing"):
@@ -1999,11 +2499,13 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 
             elif parsed.path == "/run-auto-schedule":
                 planning_date = self.optional_form_value(form, "planning_date", date.today().isoformat())
-                region_filter = self.optional_form_value(form, "region_filter", "")
+                start_location = self.safe_form_value(form, "start_location")
+                radius_km = float(self.optional_form_value(form, "radius_km", "20") or "20")
                 max_stops = int(self.optional_form_value(form, "max_stops", "8") or "8")
-                route = generate_route_plan(platform)
-                save_json_file(SCHEDULE_DIR / f"{cur['tenant']}.json", {"created_at": datetime.utcnow().isoformat(timespec="seconds"), "planning_date": planning_date, "region_filter": region_filter, "max_stops": max_stops, "route": route[:max(1,max_stops*5)]})
-                write_audit(cur["tenant"], cur["user_id"], cur["role"], "auto_schedule", {"count": len(route)})
+                mode = self.optional_form_value(form, "mode", "km")
+                route = generate_route_plan(platform, cur["tenant"], start_location, radius_km, max_stops)
+                save_json_file(SCHEDULE_DIR / f"{cur['tenant']}.json", {"created_at": datetime.utcnow().isoformat(timespec="seconds"), "planning_date": planning_date, "start_location": start_location, "radius_km": radius_km, "mode": mode, "max_stops": max_stops, "route": route[:max(1,max_stops*5)]})
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "auto_schedule", {"count": len(route), "radius_km": radius_km, "max_stops": max_stops})
                 self.redirect_with_message(f"Tourplanung erstellt ({len(route)} Einträge).", page_name="automation")
                 return
 
@@ -2321,9 +2823,12 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
         SESSIONS[token] = {"tenant": tenant, "user_id": user_id, "role": role, "csrf": secrets.token_hex(16)}
         self.send_response(303)
         cookie = f"session={token}; HttpOnly; Path=/; SameSite=Lax"
+        csrf_cookie = f"csrf_token={SESSIONS[token]['csrf']}; Path=/; SameSite=Lax"
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             cookie += "; Secure"
+            csrf_cookie += "; Secure"
         self.send_header("Set-Cookie", cookie)
+        self.send_header("Set-Cookie", csrf_cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
@@ -2334,9 +2839,12 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
             del SESSIONS[t.value]
         self.send_response(303)
         cookie = "session=; Max-Age=0; Path=/; SameSite=Lax"
+        csrf_cookie = "csrf_token=; Max-Age=0; Path=/; SameSite=Lax"
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             cookie += "; Secure"
+            csrf_cookie += "; Secure"
         self.send_header("Set-Cookie", cookie)
+        self.send_header("Set-Cookie", csrf_cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
@@ -2372,4 +2880,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
