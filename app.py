@@ -1446,6 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
       <label for='role'>Rolle</label>
       <select id='role' name='role' required>
         <option value='owner'>Owner/Admin</option>
+        <option value='admin'>Admin</option>
         <option value='disposition'>Disposition</option>
         <option value='pruefer'>Prüfer</option>
         <option value='buchhaltung'>Buchhaltung</option>
@@ -2201,7 +2202,11 @@ p1;a1;DGUV V3;180</pre>
         if not cur:
             self.redirect("/")
             return
-        if form.get("csrf", [""])[0] != cur.get("csrf", ""):
+        csrf_form = form.get("csrf", [""])[0]
+        csrf_cookie = cookies.SimpleCookie(self.headers.get("Cookie")).get("csrf_token")
+        csrf_cookie_value = csrf_cookie.value if csrf_cookie else ""
+        expected_csrf = cur.get("csrf", "")
+        if csrf_form != expected_csrf and csrf_cookie_value != expected_csrf:
             self.send_error(403)
             return
 
@@ -2818,9 +2823,12 @@ p1;a1;DGUV V3;180</pre>
         SESSIONS[token] = {"tenant": tenant, "user_id": user_id, "role": role, "csrf": secrets.token_hex(16)}
         self.send_response(303)
         cookie = f"session={token}; HttpOnly; Path=/; SameSite=Lax"
+        csrf_cookie = f"csrf_token={SESSIONS[token]['csrf']}; Path=/; SameSite=Lax"
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             cookie += "; Secure"
+            csrf_cookie += "; Secure"
         self.send_header("Set-Cookie", cookie)
+        self.send_header("Set-Cookie", csrf_cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
@@ -2831,9 +2839,12 @@ p1;a1;DGUV V3;180</pre>
             del SESSIONS[t.value]
         self.send_response(303)
         cookie = "session=; Max-Age=0; Path=/; SameSite=Lax"
+        csrf_cookie = "csrf_token=; Max-Age=0; Path=/; SameSite=Lax"
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             cookie += "; Secure"
+            csrf_cookie += "; Secure"
         self.send_header("Set-Cookie", cookie)
+        self.send_header("Set-Cookie", csrf_cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
