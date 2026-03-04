@@ -1,0 +1,18 @@
+{"ts": "2026-02-20T17:04:27.375810", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "für was ist dieses programm"}}
+{"ts": "2026-02-20T17:04:48.823019", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "die prüfung der feuerlöscher"}}
+{"ts": "2026-02-20T17:04:58.440541", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "wie mache ich das"}}
+{"ts": "2026-02-20T17:05:23.430874", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "kannst du das für mich machen"}}
+{"ts": "2026-02-20T17:05:48.508853", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "ich meine das anlegen, ob du das für mich machen kannst"}}
+{"ts": "2026-02-20T17:06:22.708207", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "was ist der nächst beste schritt"}}
+{"ts": "2026-02-20T17:06:38.998772", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "ich meine im workflow"}}
+{"ts": "2026-02-20T17:06:46.042744", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "hallo"}}
+{"ts": "2026-02-20T17:07:00.523225", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "wann ist die nächste prüfung fällig"}}
+{"ts": "2026-02-20T17:07:57.653604", "actor": "admin1", "role": "admin", "action": "add_asset_plan", "details": {"asset_id": "a1"}}
+{"ts": "2026-02-20T17:08:15.773551", "actor": "admin1", "role": "admin", "action": "quick_seed", "details": {"asset_id": "a2", "plan_id": "p2"}}
+{"ts": "2026-02-20T17:08:27.830785", "actor": "admin1", "role": "admin", "action": "quick_seed", "details": {"asset_id": "a3", "plan_id": "p3"}}
+{"ts": "2026-02-20T17:10:44.170377", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "wann die nächste prüfung"}}
+{"ts": "2026-02-20T17:34:32.100255", "actor": "admin1", "role": "admin", "action": "add_asset_plan", "details": {"asset_id": "a1"}}
+{"ts": "2026-02-20T19:25:48.517341", "actor": "admin1", "role": "admin", "action": "auto_schedule", "details": {"count": 3}}
+{"ts": "2026-02-20T19:26:18.314500", "actor": "admin1", "role": "admin", "action": "auto_offer", "details": {"count": 3, "total": 387.0}}
+{"ts": "2026-02-20T19:32:08.874181", "actor": "admin1", "role": "admin", "action": "run_no_show", "details": {"count": 3}}
+{"ts": "2026-02-20T20:36:39.630284", "actor": "admin1", "role": "admin", "action": "ask_ai", "details": {"question": "hollo was kannst du alles"}}

@@ -1,0 +1,23 @@
+{
+  "created_at": "2026-02-20T19:32:05",
+  "calls": [
+    {
+      "call_id": "C1",
+      "asset": "schaltschrank1",
+      "step": "Kunde > Teamleiter > Eskalation > Call-Task",
+      "status": "offen"
+    },
+    {
+      "call_id": "C2",
+      "asset": "Demo-Anlage",
+      "step": "Kunde > Teamleiter > Eskalation > Call-Task",
+      "status": "offen"
+    },
+    {
+      "call_id": "C3",
+      "asset": "Demo-Anlage",
+      "step": "Kunde > Teamleiter > Eskalation > Call-Task",
+      "status": "offen"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "users": [
+    {
+      "user_id": "aco",
+      "name": "aco",
+      "role": "admin",
+      "email": ""
+    }
+  ],
+  "assets": [],
+  "plans": [],
+  "records": [],
+  "invoices": []
+}

@@ -1,0 +1,4 @@
+{"ts": "2026-02-27T15:01:20.033050", "actor": "aco", "role": "owner", "action": "ask_ai", "details": {"question": "Wie funktioniert das", "pending": false}}
+{"ts": "2026-02-27T15:01:44.563640", "actor": "aco", "role": "owner", "action": "ask_ai", "details": {"question": "Wie lege ich einen Benutzer an", "pending": false}}
+{"ts": "2026-02-27T16:53:23.811237", "actor": "aco", "role": "owner", "action": "ask_ai", "details": {"question": "test", "pending": false}}
+{"ts": "2026-02-27T16:53:38.293989", "actor": "aco", "role": "owner", "action": "ask_ai", "details": {"question": "Welche Prüfung sind als nächstes Fällig", "pending": false}}

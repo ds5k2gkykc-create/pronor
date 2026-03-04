@@ -1,0 +1,12 @@
+{"ts": "2026-02-21T12:50:05.460591", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "was kannst du", "pending": false}}
+{"ts": "2026-02-21T13:47:56.232247", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "was kannst du", "pending": false}}
+{"ts": "2026-02-21T13:47:59.501929", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "was kannst du", "pending": false}}
+{"ts": "2026-02-21T14:41:12.565481", "actor": "admin1", "role": "owner", "action": "run_dunning", "details": {"count": 0}}
+{"ts": "2026-02-22T20:19:59.886294", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "lege eine anlage an", "pending": false}}
+{"ts": "2026-02-22T20:44:48.988484", "actor": "admin1", "role": "owner", "action": "import_csv", "details": {"rows": 0, "kind": "assets"}}
+{"ts": "2026-02-22T20:44:52.190738", "actor": "admin1", "role": "owner", "action": "import_csv", "details": {"rows": 0, "kind": "assets"}}
+{"ts": "2026-02-27T14:57:57.343953", "actor": "admin1", "role": "owner", "action": "user_create", "details": {"user_id": "aco"}}
+{"ts": "2026-02-27T14:59:32.424926", "actor": "admin1", "role": "owner", "action": "user_create", "details": {"user_id": "aco"}}
+{"ts": "2026-02-27T15:00:18.376391", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "erkläre das system", "pending": false}}
+{"ts": "2026-02-27T15:00:38.920510", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "bitte genauer warum braucht man dich", "pending": false}}
+{"ts": "2026-02-27T15:01:27.433095", "actor": "admin1", "role": "owner", "action": "ask_ai", "details": {"question": "ich will eine anlage anlegen", "pending": false}}
