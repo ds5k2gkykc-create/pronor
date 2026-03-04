@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import bcrypt
 import base64
 import csv
+from dataclasses import field
+from email.policy import default
 import hashlib
 import hmac
 import io
@@ -18,6 +21,14 @@ from pathlib import Path
 from sys import platform
 from urllib import error, request
 from urllib.parse import parse_qs, urlencode, urlparse
+
+from typing import TypedDict
+
+class LoginGuardEntry(TypedDict, total=False):
+    locked_until: int
+    fails: list[int]
+
+LOGIN_GUARD: dict[str, LoginGuardEntry] = {}
 
 from executive_concept_mvp import (
     Asset,
@@ -48,10 +59,51 @@ REGULATORY_SOURCES = [
     "https://www.dguv.de/de/mediencenter/rss/index.jsp",
 ]
 SESSIONS: dict[str, dict[str, str]] = {}
-JWT_SECRET = (
-    Path("data/jwt.secret").read_text().strip()
-    if Path("data/jwt.secret").exists()
-    else "dev-secret"
+MAX_FAILS = 5
+WINDOW_SECONDS = 10 * 60
+LOCK_SECONDS = 15 * 60
+
+def _client_ip(handler) -> str:
+    # falls Reverse Proxy: X-Forwarded-For nutzen, sonst direkte IP
+    xff = handler.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def guard_key(ip: str, tenant: str, user_id: str) -> str:
+    return f"{ip}|{tenant}|{user_id}"
+
+def is_locked(key: str) -> tuple[bool, int]:
+    now = int(datetime.utcnow().timestamp())
+    entry = LOGIN_GUARD.get(key)
+    if not entry:
+        return (False, 0)
+    locked_until = int(entry.get("locked_until") or 0)
+    if locked_until > now:
+        return (True, locked_until - now)
+    return (False, 0)
+
+def register_fail(key: str) -> None:
+    now = int(datetime.utcnow().timestamp())
+    entry = LOGIN_GUARD.setdefault(key, {"fails": [], "locked_until": 0})
+    fails: list[int] = entry.get("fails", [])  # type: ignore
+    # Window säubern
+    fails = [t for t in fails if now - t <= WINDOW_SECONDS]
+    fails.append(now)
+    entry["fails"] = fails
+    if len(fails) >= MAX_FAILS:
+        entry["locked_until"] = now + LOCK_SECONDS
+
+def register_success(key: str) -> None:
+    # optional: nach erfolgreichem Login Fail-Historie löschen
+    if key in LOGIN_GUARD:
+        LOGIN_GUARD.pop(key, None)
+
+secret_path = Path("data/jwt.secret")
+if not secret_path.exists():
+    raise RuntimeError("JWT secret Fehlt! Bitte data/jwt.secret anlegen.    ")
+JWT_SECRET = (secret_path.read_text().strip()
 )
 
 ROLE_LABELS = {
@@ -98,8 +150,30 @@ def to_domain_role(role: str) -> Role:
 
 # ---------- Helpers ----------
 def hash_password(raw: str) -> str:
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(raw.encode("utf-8"), salt).decode("utf-8")
 
+def verify_password(raw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(raw.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+def is_legacy_sha256_hash(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", value or ""))
+
+def verify_and_maybe_upgrade_password(raw: str, stored_hash: str) -> tuple[bool, str | None]:
+    # bcrypt hash starts typically with $2a$, $2b$, $2y$
+    if stored_hash.startswith("$2"):
+        return (verify_password(raw, stored_hash), None)
+
+    # legacy sha256
+    if is_legacy_sha256_hash(stored_hash):
+        legacy = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if hmac.compare_digest(stored_hash, legacy):
+            return (True, hash_password(raw))  # upgrade to bcrypt
+        return (False, None)
+
+    return (False, None)
 
 def load_auth() -> dict:
     if not AUTH_FILE.exists():
@@ -760,7 +834,7 @@ def nav(active: str, role: str) -> str:
     return "".join(links)
 
 
-def page(title: str, body: str, current_tab: str = "dashboard", show_logout: bool = True, role: str = "kunde") -> bytes:
+def page(title: str, body: str, current_tab: str = "dashboard", show_logout: bool = True, role: str = "kunde", csrf_token: str = "") -> bytes:
     logout_html = ""
     if show_logout:
         logout_html = """
@@ -853,6 +927,13 @@ th {{ font-size:.82rem; color:#475569; text-transform:uppercase; letter-spacing:
 </body>
 </html>
 """
+    if csrf_token:
+        html = re.sub(
+            r"(<form[^>]*method=['\"]post['\"][^>]*>)",
+            r"\1<input type='hidden' name='csrf' value='" + escape(csrf_token, quote=True) + r"'>",
+            html,
+            flags=re.IGNORECASE,
+        )
     return html.encode("utf-8")
 
 
@@ -862,6 +943,13 @@ class Handler(BaseHTTPRequestHandler):
         while f"{prefix}{idx}" in existing:
             idx += 1
         return f"{prefix}{idx}"
+    
+    def _security_headers(self) -> None:
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+
 
     def safe_form_value(self, form: dict, key: str) -> str:
         if key not in form or not form[key] or not form[key][0].strip():
@@ -870,6 +958,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def optional_form_value(self, form: dict, key: str, default: str = "") -> str:
         return form.get(key, [default])[0].strip()
+    
+    def cached_value(self, cur: dict, page_key: str, field: str, default: str = "") -> str:
+        cache = cur.get("form_cache") or {}
+        if cache.get("page") != page_key:
+            return default
+        values = cache.get("values") or {}
+        return str(values.get(field, default))
 
     def redirect_with_message(self, text: str, kind: str = "ok", page_name: str | None = None) -> None:
         query = {"msg": text, "kind": kind}
@@ -912,7 +1007,7 @@ class Handler(BaseHTTPRequestHandler):
             d = platform.dashboard()
             sla = sla_monitor(platform, cur["tenant"])
             due_states = {"rot": 0, "gelb": 0, "gruen": 0}
-            for item in d["due_inspections"]:
+            for item in d["due_inspections"]: # type: ignore
                 due_states[item["state"]] = due_states.get(item["state"], 0) + 1
             invoice_states = {"offen": 0, "teilbezahlt": 0, "bezahlt": 0, "ueberfaellig": 0}
             for inv in platform.invoices.values():
@@ -944,6 +1039,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = render_pdf_report(record, cur["tenant"])
             self.send_response(200)
             self.send_header("Content-Type", "application/pdf")
+            self._security_headers()
             self.send_header("Content-Disposition", f"attachment; filename=report-{record_id}.pdf")
             self.end_headers()
             self.wfile.write(payload)
@@ -1019,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
         elif tab == "help":
             self.respond(page("Hilfe", banner + self.help_page(), "help", role=cur["role"]))
         else:
-            self.respond(page("Dashboard", banner + self.dashboard_page(cur, platform), "dashboard", role=cur["role"]))
+            self.respond(page("Dashboard", banner + self.dashboard_page(cur, platform), "dashboard", role=cur["role"], csrf_token=cur.get("csrf","")))
 
     def render_login(self) -> None:
         body = f"""
@@ -1081,8 +1177,10 @@ class Handler(BaseHTTPRequestHandler):
             invoice_states[inv.status.value] = invoice_states.get(inv.status.value, 0) + 1
 
         due_states = {"rot": 0, "gelb": 0, "gruen": 0}
-        for item in d["due_inspections"]:
-            due_states[item["state"]] = due_states.get(item["state"], 0) + 1
+        due_list = d.get("due_inspections") or []
+        if due_list and isinstance(due_list, list):
+            for item in due_list:
+                due_states[item.get("state", "gruen")] = due_states.get(item.get("state", "gruen"), 0) + 1
 
         return f"""
 <div class='card'>
@@ -1444,6 +1542,8 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
 """
 
     def records_page(self, cur: dict, platform) -> str:
+        page_key = "records"
+
         rows = "".join(
             f"<tr><td>{escape(r.record_id)}</td><td>{escape(r.plan_id)}</td><td>{escape(r.result)}</td><td>{r.updated_at.isoformat()}</td><td><a href='/export-record-pdf?record_id={escape(r.record_id)}'>PDF</a></td></tr>"
             for r in platform.records.values()
@@ -1453,19 +1553,20 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   <h2>Prüfungen & Rechnungen</h2>
   {info_box('Was und warum?', 'Hier entsteht der Kernprozess: Prüfung dokumentieren und (als Admin) Rechnung erstellen.')}
   <form method='post' action='/record-and-invoice'>
-    {label_input('Protokoll-ID', 'record_id', 'r1')}
-    {label_input('Plan-ID', 'plan_id', 'p1')}
-    {label_input('Prüfer-ID', 'inspector_id', 'pruefer1')}
-    {label_input('Ergebnis', 'result', 'bestanden', 'text', 'bestanden')}
-    {label_input('Messwert', 'measurement', 'z. B. 0.22 Ohm')}
-    {label_input('Anhang/Foto', 'attachment_ref', 'z. B. foto-001.jpg')}
-    {label_input('Signatur (Name)', 'signature_name', 'z. B. M. Prüfer')}
-    {label_input('Kunden-Signatur (optional)', 'customer_signature', 'z. B. Kunde A')}
-    {label_input('Template-Zusatzfeld (optional)', 'required_extra_value', 'z. B. Serienfoto-ID')}
-    <div class='field'><label for='findings'>Feststellungen</label><textarea id='findings' name='findings' placeholder='z. B. Keine Mängel' required>Keine Mängel</textarea></div>
-    {label_input('Rechnungs-ID', 'invoice_id', 'i1')}
-    {label_input('Kunde', 'invoice_customer', 'Muster GmbH')}
-    {label_input('Preis pro Prüfung', 'price', '149', 'number', '149')}
+  <input type='hidden' name='page' value='records'>
+    {label_input('Protokoll-ID', 'record_id', 'r1', value=self.cached_value(cur, page_key, 'record_id', 'r1'))}
+    {label_input('Plan-ID', 'plan_id', 'p1', value=self.cached_value(cur, page_key, 'plan_id', 'p1'))}
+    {label_input('Prüfer-ID', 'inspector_id', 'pruefer1', value=self.cached_value(cur, page_key, 'inspector_id', 'pruefer1'))}
+    {label_input('Ergebnis', 'result', 'bestanden', 'text', value=self.cached_value(cur, page_key, 'result', 'bestanden'))}
+    {label_input('Messwert', 'measurement', 'z. B. 0.22 Ohm', value=self.cached_value(cur, page_key, 'measurement', ''))}
+    {label_input('Anhang/Foto', 'attachment_ref', 'z. B. foto-001.jpg', value=self.cached_value(cur, page_key, 'attachment_ref', ''))}
+    {label_input('Signatur (Name)', 'signature_name', 'z. B. M. Prüfer', value=self.cached_value(cur, page_key, 'signature_name', ''))}
+    {label_input('Kunden-Signatur (optional)', 'customer_signature', 'z. B. Kunde A', value=self.cached_value(cur, page_key, 'customer_signature', ''))}
+    {label_input('Template-Zusatzfeld (optional)', 'required_extra_value', 'z. B. Serienfoto-ID', value=self.cached_value(cur, page_key, 'required_extra_value', ''))}
+    <div class='field'><label for='findings'>Feststellungen</label><textarea id='findings' name='findings' placeholder='z. B. Keine Mängel' required>{escape(self.cached_value(cur, page_key, 'findings', 'Keine Mängel'))}</textarea></div>
+    {label_input('Rechnungs-ID', 'invoice_id', 'i1', value=self.cached_value(cur, page_key, 'invoice_id', 'i1'))}
+    {label_input('Kunde', 'invoice_customer', 'Muster GmbH', value=self.cached_value(cur, page_key, 'invoice_customer', 'Muster GmbH'))}
+    {label_input('Preis pro Prüfung', 'price', '149', 'number', self.cached_value(cur, page_key, 'price', '149'))}
     <div class='field'><button type='submit'>Prüfung speichern / Rechnung anlegen</button></div>
   </form>
   <p class='muted'>Hinweis: Rechnung wird nur erstellt, wenn du als Admin angemeldet bist (aktuell: {cur['role']}).</p>
@@ -1527,14 +1628,55 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   <p class='muted'>Tipp: Siehe auch BEDIENUNGSANLEITUNG.md im Projektordner.</p>
 </div>
 """
+    def ai_script_block(self) -> str: 
+        return r"""
+            function md(text) {
+            let out = text
+                .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                .replace(/`(.*?)`/g, '<code>$1</code>')
+                .replace(/\n/g, '<br/>');
+            return out;
+     }
 
+        for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {
+            const full = node.getAttribute('data-full') || '';
+            node.textContent = '';
+            let i = 0;
+            const timer = setInterval(() => {
+                 i += 2;
+                node.innerHTML = md(full.slice(0, i));
+                if (i >= full.length) clearInterval(timer);
+            }, 14);
+        }
+
+        document.addEventListener('click', (e) => {
+         const btn = e.target.closest('.quick-btn');
+            if (!btn) return;
+
+            e.preventDefault();
+
+            const textarea = document.getElementById('question');
+            if (!textarea) return;
+
+            const form = textarea.closest('form');
+            if (!form) return;
+
+            textarea.value = btn.getAttribute('data-quick') || '';
+            textarea.focus();
+
+            if (form.requestSubmit) form.requestSubmit();
+            else form.submit();
+        });
+    """.strip()
+
+    
     def ai_page(self, cur: dict, platform) -> str:
         history = cur.get("ai_history", [])
         bubbles = []
         for item in history[-12:]:
-            bubbles.append(f"<div class='bubble user'>{escape(item['q'])}</div>")
+            bubbles.append(f"<div class='bubble user'>{escape(item['q'], quote=True)}</div>")
             bubbles.append(
-                f"<div class='bubble ai' data-full='{escape(item['a'])}'>{escape(item['a'])}</div>"
+                f"<div class='bubble ai' data-full='{escape(item['a'], quote=True)}'>{escape(item['a'], quote=True)}</div>"
             )
         history_html = "".join(bubbles) or "<p class='muted'>Noch keine Fragen gestellt.</p>"
         pending = cur.get("pending_ai_action", "")
@@ -1551,9 +1693,9 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   <h2 class='page-title'>AI-Chat</h2>
   {info_box('Sicherer Modus', 'Die AI kann Aktionen nur vorschlagen. Ausführung erfolgt erst nach deiner expliziten Bestätigung.')}
   <div class='quick-actions'>
-  <button type="button" class="quick-btn" data-quick="abrechnungsvorschlag:Muster GmbH|149">Angebot generieren</button>
-  <button type="button" class="quick-btn" data-quick="Welche Termine sind kritisch und was schlägst du vor?">Termin vorschlagen</button>
-  <button type="button" class="quick-btn" data-quick="qualitaetscheck:p1|0.21 Ohm|foto-001.jpg|M. Prüfer">Protokoll prüfen</button>
+    <button type="button" class="quick-btn" data-quick="abrechnungsvorschlag:Muster GmbH|149">Angebot generieren</button>
+    <button type="button" class="quick-btn" data-quick="Welche Termine sind kritisch und was schlägst du vor?">Termin vorschlagen</button>
+    <button type="button" class="quick-btn" data-quick="qualitaetscheck:p1|0.21 Ohm|foto-001.jpg|M. Prüfer">Protokoll prüfen</button>
   </div>
   <form method='post' action='/ask-ai'>
     <div class='field' style='grid-column:1/-1'>
@@ -1569,33 +1711,7 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   <div class='chat' id='chat'>{history_html}</div>
 </div>
 <script>
-function md(text) {{
-  let out = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>').replace(/`(.*?)`/g, '<code>$1</code>').replace(/\n/g, '<br/>');
-  return out;
-}}
-for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
-  const full = node.getAttribute('data-full') || '';
-  node.textContent = '';
-  let i = 0;
-  const timer = setInterval(() => {{
-    i += 2;
-    node.innerHTML = md(full.slice(0, i));
-    if (i >= full.length) clearInterval(timer);
-  }}, 14);
-}}
-(function () {{
-  const textarea = document.getElementById('question');
-
-  document.querySelectorAll('.quick-btn').forEach(btn => {{
-    btn.addEventListener('click', () => {{
-      const text = btn.getAttribute('data-quick') || '';
-      if (textarea) {{
-        textarea.value = text;
-        textarea.focus();
-      }}
-    }});
-  }});
-}})();
+{self.ai_script_block()}
 </script>
 """
 
@@ -1614,14 +1730,21 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
             role = payload.get("role", "")
             password = payload.get("password", "")
             otp = payload.get("otp", "")
-            users = {
-                u["user_id"]: u
-                for u in load_auth().get(tenant, {}).get("users", [])
-            }
+            auth_data = load_auth()
+            users = {u["user_id"]: u for u in auth_data.get(tenant, {}).get("users", [])} 
             user = users.get(user_id)
-            if not user or user["role"] != role or user["password_hash"] != hash_password(password):
+            if not user or user["role"] != role:
                 self.send_error(401)
                 return
+            ok, upgraded = verify_and_maybe_upgrade_password(password, user["password_hash"])
+            if not ok:
+                self.send_error(401)
+                return
+            if upgraded:
+                user["password_hash"] = upgraded
+                auth_data[tenant]["users"] = list(users.values())
+                save_auth(auth_data)
+
             if user.get("otp_secret") and otp != user["otp_secret"][-6:]:
                 self.send_error(401)
                 return
@@ -1682,6 +1805,9 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
         cur = self.current()
         if not cur:
             self.redirect("/")
+            return
+        if form.get("csrf", [""])[0] != cur.get("csrf", ""):
+            self.send_error(403)
             return
 
         platform = storage.load(cur["tenant"])
@@ -1772,8 +1898,8 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
                 measurement = self.safe_form_value(form, "measurement")
                 attachment_ref = self.safe_form_value(form, "attachment_ref")
                 signature_name = self.safe_form_value(form, "signature_name")
-                customer_signature = self.safe_form_value(form, "customer_signature")
-                required_extra_value = self.safe_form_value(form, "required_extra_value")
+                customer_signature = self.optional_form_value(form, "customer_signature")
+                required_extra_value = self.optional_form_value(form, "required_extra_value")
                 findings = form["findings"][0]
                 invoice_customer = self.safe_form_value(form, "invoice_customer")
                 is_valid, required_label = validate_template_requirements(cur["tenant"], invoice_customer, required_extra_value)
@@ -1902,7 +2028,9 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
                 return
 
             elif parsed.path == "/run-no-show-cascade":
-                pending = [d for d in platform.dashboard()["due_inspections"] if d["state"] in {"rot", "gelb"}]
+                dashboard_data = platform.dashboard()
+                due_inspections = dashboard_data.get("due_inspections") or []
+                pending = [d for d in due_inspections if isinstance(d, dict) and d.get("state") in {"rot", "gelb"}] # type: ignore
                 calls = []
                 for idx, item in enumerate(pending[:20]):
                     calls.append(
@@ -2125,7 +2253,12 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
                 return
 
         except (ValueError, KeyError) as err:
-            self.redirect_with_message(f"Eingabefehler: {err}", kind="error")
+            page_name = form.get("page", ["dashboard"])[0]
+            cur["form_cache"] = {
+                "page": page_name, 
+                "values": {k: (v[0] if isinstance(v, list) and v else "") for k, v in form.items()},
+            }
+            self.redirect_with_message(f"Eingabefehler: {str(err)}", kind="error", page_name = page_name)
             return
 
         storage.save(cur["tenant"], platform)
@@ -2136,7 +2269,16 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
         user_id = form.get("user_id", [""])[0]
         role = form.get("role", [""])[0]
         password = form.get("password", [""])[0]
-        otp = form.get("otp", [""])[0]
+        otp = form.get("otp", [""])[0] 
+        ip = _client_ip(self)
+        key = guard_key(ip, tenant, user_id)
+        locked, retry_in = is_locked(key)
+        if locked:
+            self.redirect_with_message(
+                f"Zu viele Fehlversuche. Bitte in {retry_in} Sekunden erneut versuchen.",
+                kind="error",
+            )
+            return
 
         auth = load_auth()
         auth.setdefault(tenant, {"users": []})
@@ -2158,17 +2300,30 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
             save_auth(auth)
 
         user = users.get(user_id)
-        if not user or user["role"] != role or user["password_hash"] != hash_password(password):
+        if not user or user["role"] != role:
+            register_fail(key)
             self.redirect_with_message("Login fehlgeschlagen. Bitte Daten prüfen.", kind="error")
             return
-        if user.get("otp_secret") and otp != user["otp_secret"][-6:]:
-            self.redirect_with_message("2FA-Code ungültig.", kind="error")
+
+        ok, upgraded = verify_and_maybe_upgrade_password(password, user["password_hash"])
+        if not ok:
+            register_fail(key)
+            self.redirect_with_message("Login fehlgeschlagen. Bitte Daten prüfen.", kind="error")
             return
 
+        if upgraded:
+            user["password_hash"] = upgraded
+            auth[tenant]["users"] = list(users.values())
+            save_auth(auth)
+        
+        register_success(key)
         token = secrets.token_hex(16)
-        SESSIONS[token] = {"tenant": tenant, "user_id": user_id, "role": role}
+        SESSIONS[token] = {"tenant": tenant, "user_id": user_id, "role": role, "csrf": secrets.token_hex(16)}
         self.send_response(303)
-        self.send_header("Set-Cookie", f"session={token}; HttpOnly; Path=/")
+        cookie = f"session={token}; HttpOnly; Path=/; SameSite=Lax"
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
@@ -2178,13 +2333,17 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
         if t and t.value in SESSIONS:
             del SESSIONS[t.value]
         self.send_response(303)
-        self.send_header("Set-Cookie", "session=; Max-Age=0; Path=/")
+        cookie = "session=; Max-Age=0; Path=/; SameSite=Lax"
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
         self.send_header("Location", "/")
         self.end_headers()
 
     def respond(self, payload: bytes) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._security_headers()
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -2193,12 +2352,14 @@ for (const node of document.querySelectorAll('.bubble.ai[data-full]')) {{
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._security_headers()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def redirect(self, target: str) -> None:
         self.send_response(303)
+        self._security_headers()
         self.send_header("Location", target)
         self.end_headers()
 
@@ -2211,3 +2372,4 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
