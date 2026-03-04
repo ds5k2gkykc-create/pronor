@@ -13,6 +13,10 @@ from app import (
     execute_ai_action,
     generate_route_plan,
     hash_password,
+    verify_password,
+    haversine_km,
+    parse_lat_lng,
+    filter_assets_in_radius,
     parse_csv_rows,
     render_pdf_report,
     sign_jwt,
@@ -85,7 +89,8 @@ def test_merge_strategy_and_invoice_status():
 def test_helpers_csv_hash_pdf_and_jwt():
     rows = parse_csv_rows("asset_id,name,serial_number,location,asset_type\na1,Motor,SN1,Werk,Elektro")
     assert rows[0]["name"] == "Motor"
-    assert hash_password("secret") == hash_password("secret")
+    hashed = hash_password("secret")
+    assert verify_password("secret", hashed)
     pdf = render_pdf_report(InspectionRecord("r1", "p1", "u1", date.today(), "ok", "none"), "tenant")
     assert pdf.startswith(b"%PDF")
     token = sign_jwt({"tenant": "t1", "exp": 9999999999})
@@ -225,3 +230,13 @@ def test_template_validation_and_recurring_and_health(tmp_path, monkeypatch):
     lost = lost_revenue_list(p)
     assert lost and lost[0]["reason"] in {"keine Rechnung", "keine Prüfung"}
     assert isinstance(explain_red_items(p), list)
+
+def test_geo_helpers_and_csv_delimiter():
+    assert parse_lat_lng("52.1,13.4") == (52.1, 13.4)
+    assert parse_lat_lng("x") is None
+    dist = haversine_km(52.52, 13.405, 48.137, 11.575)
+    assert dist > 400
+    rows = parse_csv_rows("asset_id;name\na1;Anlage", delimiter=";")
+    assert rows[0]["asset_id"] == "a1"
+    filtered = filter_assets_in_radius((52.52, 13.4), [{"lat": 52.5, "lng": 13.42, "asset": "A"}], 10)
+    assert len(filtered) == 1
