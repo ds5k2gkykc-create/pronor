@@ -3,6 +3,7 @@ from __future__ import annotations
 import bcrypt
 import base64
 import csv
+import os
 from dataclasses import field
 from email.policy import default
 import hashlib
@@ -32,14 +33,27 @@ class LoginGuardEntry(TypedDict, total=False):
 
 LOGIN_GUARD: dict[str, LoginGuardEntry] = {}
 
-from executive_concept_mvp import (
-    Asset,
-    InspectionPlan,
-    InspectionRecord,
-    Role,
-    TenantStorage,
-    User,
-)
+try:
+    from executive_concept_mvp import (
+        Asset,
+        InspectionPlan,
+        InspectionRecord,
+        Role,
+        TenantStorage,
+        User,
+    )
+except ModuleNotFoundError as exc:
+    # Local fallback when running this file outside the pronor package layout.
+    if exc.name != "pronor":
+        raise
+    from executive_concept_mvp import (
+        Asset,
+        InspectionPlan,
+        InspectionRecord,
+        Role,
+        TenantStorage,
+        User,
+    )
 
 storage = TenantStorage()
 AUTH_FILE = Path("data/auth.json")
@@ -459,7 +473,7 @@ def execute_ai_action(question: str, platform, auth_data: dict, tenant: str, id_
         for idx in range(amount):
             asset_id = id_builder("a", platform.assets)
             plan_id = id_builder("p", platform.plans)
-            platform.add_asset(Asset(asset_id, f"{customer}-Asset-{idx+1}", f"SN-{asset_id}", location, "Elektroanlage"))
+            platform.add_asset(Asset(asset_id, f"{customer}-Asset-{idx+1}", f"SN-{asset_id}", location, "Elektroanlage", customer))
             platform.add_plan(InspectionPlan(plan_id, asset_id, "DGUV V3", interval))
             created.append((asset_id, plan_id))
         route = generate_route_plan(platform)
@@ -873,7 +887,16 @@ def apply_import_rows(kind: str, rows: list[dict[str, str]], platform) -> tuple[
     created_plans = 0
     if kind == "assets":
         for row in rows:
-            platform.add_asset(Asset(row["asset_id"], row["name"], row["serial_number"], row["location"], row["asset_type"]))
+            platform.add_asset(
+                Asset(
+                    row["asset_id"],
+                    row["name"],
+                    row["serial_number"],
+                    row["location"],
+                    row["asset_type"],
+                    str(row.get("company", "")).strip(),
+                )
+            )
             created_assets += 1
     else:
         for row in rows:
@@ -1164,12 +1187,19 @@ th {{ font-size:.82rem; color:#475569; text-transform:uppercase; letter-spacing:
 .stack {{ display:grid; gap:1rem; }}
 .answer {{ background:linear-gradient(180deg,#ffffff,#f8fafc); border:1px solid #e2e8f0; border-radius:12px; padding:.8rem; }}
 .page-title {{ margin:.1rem 0 .6rem 0; }}
+.dashboard-layout {{ display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:1rem; align-items:start; }}
+.dashboard-main {{ min-width:0; }}
+.dashboard-sidebar {{ display:grid; gap:1rem; position:sticky; top:1rem; align-self:start; }}
 .chat {{ display:flex; flex-direction:column; gap:.6rem; }}
 .bubble {{ max-width:78%; padding:.7rem .8rem; border-radius:12px; line-height:1.35; }}
 .bubble.user {{ align-self:flex-end; background:#dbeafe; border:1px solid #93c5fd; }}
 .bubble.ai {{ align-self:flex-start; background:#f8fafc; border:1px solid #cbd5e1; }}
 .quick-actions {{ display:flex; gap:.5rem; flex-wrap:wrap; margin:.4rem 0 .8rem 0; }}
 .quick-actions button {{ background:#eef2ff; color:#1e3a8a; border:1px solid #c7d2fe; }}
+.control-row {{ display:flex; gap:.6rem; flex-wrap:wrap; align-items:end; margin:.35rem 0 .8rem; }}
+.control-row .field {{ min-width:190px; margin:0; }}
+.inline-check {{ display:inline-flex; align-items:center; gap:.45rem; font-size:.88rem; color:#334155; font-weight:600; }}
+.inline-check input {{ width:auto; padding:0; margin:0; }}
 .kpi {{ transition:transform .25s ease, box-shadow .25s ease; }}
 .table-wrap {{ transition:box-shadow .2s ease; }}
 .table-wrap:hover {{ box-shadow:inset 0 0 0 1px #dbeafe; border-radius:8px; }}
@@ -1177,6 +1207,10 @@ th {{ font-size:.82rem; color:#475569; text-transform:uppercase; letter-spacing:
 .row-enter {{ animation:rowIn .25s ease both; }}
 @keyframes fadeInUp {{ from {{ opacity:0; transform:translateY(8px); }} to {{ opacity:1; transform:translateY(0); }} }}
 @keyframes rowIn {{ from {{ opacity:.2; transform:translateX(-6px); }} to {{ opacity:1; transform:translateX(0); }} }}
+@media (max-width: 1100px) {{
+  .dashboard-layout {{ grid-template-columns:1fr; }}
+  .dashboard-sidebar {{ position:static; }}
+}}
 @media (max-width: 760px) {{
   .wrapper {{ padding:.8rem; }}
   .header {{ padding:.7rem .8rem; }}
@@ -1333,10 +1367,23 @@ class Handler(BaseHTTPRequestHandler):
             cur = self.current()
             platform = storage.load(cur["tenant"])
             buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=["Asset-ID", "Anlagenname", "Seriennummer", "Standort", "Anlagentyp"], delimiter=";")
+            writer = csv.DictWriter(
+                buf,
+                fieldnames=["Asset-ID", "Anlagenname", "Seriennummer", "Standort", "Anlagentyp", "Unternehmen"],
+                delimiter=";",
+            )
             writer.writeheader()
             for asset in platform.assets.values():
-                writer.writerow({"Asset-ID": asset.asset_id, "Anlagenname": asset.name, "Seriennummer": asset.serial_number, "Standort": asset.location, "Anlagentyp": asset.asset_type})
+                writer.writerow(
+                    {
+                        "Asset-ID": asset.asset_id,
+                        "Anlagenname": asset.name,
+                        "Seriennummer": asset.serial_number,
+                        "Standort": asset.location,
+                        "Anlagentyp": asset.asset_type,
+                        "Unternehmen": getattr(asset, "company", ""),
+                    }
+                )
             data = buf.getvalue().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
@@ -1477,10 +1524,11 @@ class Handler(BaseHTTPRequestHandler):
             f"<li><b>{escape(item['title'])}</b><br/><small class='muted'>{escape(item['published'])}</small></li>"
             for item in updates[:5]
         )
+        due_list = d.get("due_inspections") or []
         due_rows = "".join(
-            f"<tr><td>{escape(item['asset'])}</td><td>{escape(item['regulation'])}</td><td>{escape(item['due_date'])}</td><td>{traffic_badge(item['state'])}</td></tr>"
-            for item in d["due_inspections"]
-        ) or "<tr><td colspan='4'>Keine Prüfpläne vorhanden.</td></tr>"
+            f"<tr><td>{escape(item['asset'])}</td><td>{escape(str(item.get('company') or 'Ohne Unternehmen'))}</td><td>{escape(item['regulation'])}</td><td>{escape(item['due_date'])}</td><td>{traffic_badge(item['state'])}</td></tr>"
+            for item in due_list
+        ) or "<tr><td colspan='5'>Keine Prüfpläne vorhanden.</td></tr>"
         lost_rows = "".join(
             f"<tr><td>{escape(item['asset'])}</td><td>{escape(item['due_date'])}</td><td>{escape(item['reason'])}</td></tr>"
             for item in lost[:8]
@@ -1495,62 +1543,231 @@ class Handler(BaseHTTPRequestHandler):
             invoice_states[inv.status.value] = invoice_states.get(inv.status.value, 0) + 1
 
         due_states = {"rot": 0, "gelb": 0, "gruen": 0}
-        due_list = d.get("due_inspections") or []
         if due_list and isinstance(due_list, list):
             for item in due_list:
                 due_states[item.get("state", "gruen")] = due_states.get(item.get("state", "gruen"), 0) + 1
 
+        ai_history = cur.get("ai_history", [])
+        ai_bubbles = []
+        for item in ai_history[-8:]:
+            ai_bubbles.append(f"<div class='bubble user'>{escape(item['q'], quote=True)}</div>")
+            ai_bubbles.append(f"<div class='bubble ai' data-full='{escape(item['a'], quote=True)}'>{escape(item['a'], quote=True)}</div>")
+        ai_history_html = "".join(ai_bubbles) or "<p class='muted'>Noch keine Fragen gestellt.</p>"
+
+        pending = cur.get("pending_ai_action", "")
+        pending_box = ""
+        if pending:
+            pending_box = (
+                "<div class='card'><b>Ausstehende AI-Aktion:</b> "
+                + escape(pending)
+                + "<form method='post' action='/confirm-ai-action'>"
+                + "<input type='hidden' name='page' value='dashboard'>"
+                + "<button type='submit'>Aktion bestaetigen</button></form></div>"
+            )
+
         return f"""
-<div class='card'>
-  <h2>Willkommen, {cur['user_id']} ({ROLE_LABELS.get(cur['role'], cur['role'])})</h2>
-  <p class='muted'>Live-Status der Prüfungen und Rechnungen. Aktualisiert alle 10 Sekunden.</p>
-</div>
-<div class='grid'>
-  <div class='kpi'><small>Anlagen</small><h3 id='kpi-assets'>{d['assets']}</h3></div>
-  <div class='kpi'><small>Prüfprotokolle</small><h3 id='kpi-records'>{d['inspection_records']}</h3></div>
-  <div class='kpi'><small>Offene Rechnungen</small><h3 id='kpi-invoices'>{d['open_invoices']}</h3></div>
-  <div class='kpi'><small>Eskalations-Reminder</small><h3 id='kpi-reminders'>{reminder_count}</h3></div>
-  <div class='kpi'><small>SLA-Risiko</small><h3 id='kpi-sla'>{sla['sla_risk_score']}</h3></div>
-  <div class='kpi'><small>Mandanten-Health</small><h3 id='kpi-health'>{health}</h3></div>
-</div>
-<div class='card stack'>
-  <h3>Ampelsystem (Fälligkeiten)</h3>
-  <div class='table-wrap'>
-    <table>
-      <tr><th>Anlage</th><th>Regelwerk</th><th>Fällig am</th><th>Status</th></tr>
-      <tbody id='due-body'>{due_rows}</tbody>
-    </table>
+<div class='dashboard-layout'>
+  <div class='dashboard-main'>
+    <div class='card'>
+      <h2>Willkommen, {cur['user_id']} ({ROLE_LABELS.get(cur['role'], cur['role'])})</h2>
+      <p class='muted'>Live-Status der Prüfungen und Rechnungen. Aktualisiert alle 10 Sekunden.</p>
+    </div>
+    <div class='grid'>
+      <div class='kpi'><small>Anlagen</small><h3 id='kpi-assets'>{d['assets']}</h3></div>
+      <div class='kpi'><small>Prüfprotokolle</small><h3 id='kpi-records'>{d['inspection_records']}</h3></div>
+      <div class='kpi'><small>Offene Rechnungen</small><h3 id='kpi-invoices'>{d['open_invoices']}</h3></div>
+      <div class='kpi'><small>Eskalations-Reminder</small><h3 id='kpi-reminders'>{reminder_count}</h3></div>
+      <div class='kpi'><small>SLA-Risiko</small><h3 id='kpi-sla'>{sla['sla_risk_score']}</h3></div>
+      <div class='kpi'><small>Mandanten-Health</small><h3 id='kpi-health'>{health}</h3></div>
+    </div>
+    <div class='card stack'>
+      <h3>Ampelsystem (Fälligkeiten)</h3>
+      <div class='control-row'>
+        <div class='field'>
+          <label for='due-sort-mode'>Sortierung</label>
+          <select id='due-sort-mode' name='due_sort_mode'>
+            <option value='due'>Nach Fälligkeit</option>
+            <option value='company'>Nach Unternehmen</option>
+          </select>
+        </div>
+        <div class='field' id='due-company-field' style='display:none'>
+          <label for='due-company'>Unternehmen auswählen</label>
+          <select id='due-company' name='due_company'>
+            <option value=''>Alle Unternehmen</option>
+          </select>
+        </div>
+        <label class='inline-check' id='due-company-due-wrap' style='display:none'>
+          <input id='due-company-due-toggle' type='checkbox' />
+          Innerhalb Unternehmen nach Fälligkeit
+        </label>
+      </div>
+      <div class='table-wrap'>
+        <table>
+          <tr><th>Anlage</th><th>Unternehmen</th><th>Regelwerk</th><th>Fällig am</th><th>Status</th></tr>
+          <tbody id='due-body'>{due_rows}</tbody>
+        </table>
+      </div>
+      <small class='muted' id='live-updated'>Letztes Update: -</small>
+    </div>
+    <div class='grid'>
+      <div class='card'>
+        <h3>Diagramm: Fälligkeiten</h3>
+        <canvas id='dueChart' width='420' height='220'></canvas>
+      </div>
+      <div class='card'>
+        <h3>Diagramm: Rechnungsstatus</h3>
+        <canvas id='invoiceChart' width='420' height='220'></canvas>
+      </div>
+    </div>
+    <div class='card'>
+      <h3>Aktuelle Bürokratie-/Regelwerks-Updates</h3>
+      <ul id='reg-updates'>{update_rows}</ul>
+      <p class='muted'>Automatisch aktualisiert (mit Fallback bei Verbindungsproblemen).</p>
+    </div>
+    <div class='grid'>
+      <div class='card'><h3>Verlorener Umsatz</h3><div class='table-wrap'><table><tr><th>Asset</th><th>Fällig</th><th>Grund</th></tr>{lost_rows}</table></div></div>
+      <div class='card'><h3>Warum ist das rot?</h3><div class='table-wrap'><table><tr><th>Asset</th><th>Erklärung</th></tr>{red_rows}</table></div></div>
+    </div>
+    <div class='card'>
+      <h3>Schnellfunktionen</h3>
+      <form method='post' action='/quick-seed'>
+        {label_input('Vorlagen-Standort', 'location', 'Werk 1')}
+        <div class='field'><button type='submit'>Demo-Anlage + Prüfplan automatisch anlegen</button></div>
+      </form>
+    </div>
   </div>
-  <small class='muted' id='live-updated'>Letztes Update: -</small>
+  <aside class='dashboard-sidebar'>
+    <div class='card'>
+      <h3>AI-Chat</h3>
+      {info_box('Sicherer Modus', 'Die AI kann Aktionen nur vorschlagen. Ausführung erfolgt erst nach deiner expliziten Bestätigung.')}
+      <div class='quick-actions'>
+        <button type="button" class="quick-btn" data-quick="abrechnungsvorschlag:Muster GmbH|149">Angebot generieren</button>
+        <button type="button" class="quick-btn" data-quick="Welche Termine sind kritisch und was schlägst du vor?">Termin vorschlagen</button>
+      </div>
+      <form method='post' action='/ask-ai'>
+        <input type='hidden' name='page' value='dashboard'>
+        <div class='field' style='grid-column:1/-1'>
+          <label for='question'>Nachricht</label>
+          <textarea id='question' name='question' placeholder='Frage oder Befehlsvorschlag eingeben...' required></textarea>
+        </div>
+        <div class='field'><button type='submit'>Senden</button></div>
+      </form>
+    </div>
+    {pending_box}
+    <div class='card'>
+      <h3>Chatverlauf</h3>
+      <div class='chat' id='chat'>{ai_history_html}</div>
+    </div>
+  </aside>
 </div>
-<div class='grid'>
-  <div class='card'>
-    <h3>Diagramm: Fälligkeiten</h3>
-    <canvas id='dueChart' width='420' height='220'></canvas>
-  </div>
-  <div class='card'>
-    <h3>Diagramm: Rechnungsstatus</h3>
-    <canvas id='invoiceChart' width='420' height='220'></canvas>
-  </div>
-</div>
-<div class='card'>
-  <h3>Aktuelle Bürokratie-/Regelwerks-Updates</h3>
-  <ul id='reg-updates'>{update_rows}</ul>
-  <p class='muted'>Automatisch aktualisiert (mit Fallback bei Verbindungsproblemen).</p>
-</div>
-<div class='grid'>
-  <div class='card'><h3>Verlorener Umsatz</h3><div class='table-wrap'><table><tr><th>Asset</th><th>Fällig</th><th>Grund</th></tr>{lost_rows}</table></div></div>
-  <div class='card'><h3>Warum ist das rot?</h3><div class='table-wrap'><table><tr><th>Asset</th><th>Erklärung</th></tr>{red_rows}</table></div></div>
-</div>
-<div class='card'>
-  <h3>Schnellfunktionen</h3>
-  <form method='post' action='/quick-seed'>
-    {label_input('Vorlagen-Standort', 'location', 'Werk 1')}
-    <div class='field'><button type='submit'>Demo-Anlage + Prüfplan automatisch anlegen</button></div>
-  </form>
-</div>
-{info_box('Nächster Schritt', 'Gehe links auf „Anlagen & Prüfpläne“, dann auf „Prüfungen & Rechnungen“.')}
 <script>
+const dueSortMode = document.getElementById('due-sort-mode');
+const dueCompanyField = document.getElementById('due-company-field');
+const dueCompany = document.getElementById('due-company');
+const dueCompanyDueWrap = document.getElementById('due-company-due-wrap');
+const dueCompanyDueToggle = document.getElementById('due-company-due-toggle');
+let dashboardDueItems = {json.dumps(due_list)};
+
+function dueStateOrder(state) {{
+  if (state === 'rot') return 0;
+  if (state === 'gelb') return 1;
+  return 2;
+}}
+
+function dueDateValue(raw) {{
+  const parsed = Date.parse(raw || '');
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+}}
+
+function updateDueControlVisibility() {{
+  const byCompany = (dueSortMode?.value || 'due') === 'company';
+  if (dueCompanyField) dueCompanyField.style.display = byCompany ? 'flex' : 'none';
+  if (dueCompanyDueWrap) dueCompanyDueWrap.style.display = byCompany ? 'inline-flex' : 'none';
+}}
+
+function updateCompanyOptions(items) {{
+  if (!dueCompany) return;
+  const current = dueCompany.value;
+  const companies = [...new Set((items || []).map(item => (item.company || 'Ohne Unternehmen').trim() || 'Ohne Unternehmen'))]
+    .sort((a, b) => a.localeCompare(b, 'de'));
+  dueCompany.innerHTML = '';
+  const allOption = document.createElement('option');
+  allOption.value = '';
+  allOption.textContent = 'Alle Unternehmen';
+  dueCompany.appendChild(allOption);
+  for (const company of companies) {{
+    const option = document.createElement('option');
+    option.value = company;
+    option.textContent = company;
+    dueCompany.appendChild(option);
+  }}
+  if (companies.includes(current)) {{
+    dueCompany.value = current;
+  }}
+}}
+
+function renderDueRows(items) {{
+  const body = document.getElementById('due-body');
+  if (!body) return;
+  body.innerHTML = '';
+  for (const item of items) {{
+    const label = item.state === 'rot' ? 'Ueberfaellig' : item.state === 'gelb' ? 'Bald faellig' : 'OK';
+    const color = item.state === 'rot' ? '#d92d20' : item.state === 'gelb' ? '#f79009' : '#12b76a';
+    const row = document.createElement('tr');
+    row.className = 'row-enter';
+    const company = (item.company || 'Ohne Unternehmen');
+    [item.asset, company, item.regulation, item.due_date].forEach(value => {{
+      const td = document.createElement('td');
+      td.textContent = String(value || '');
+      row.appendChild(td);
+    }});
+    const statusTd = document.createElement('td');
+    statusTd.innerHTML = `<span style=\"display:inline-flex;align-items:center;gap:.35rem\"><span style=\"width:.62rem;height:.62rem;border-radius:999px;background:${{color}};display:inline-block\"></span>${{label}}</span>`;
+    row.appendChild(statusTd);
+    body.appendChild(row);
+  }}
+  if (!items.length) {{
+    body.innerHTML = '<tr><td colspan=\"5\">Keine Prüfpläne vorhanden.</td></tr>';
+  }}
+}}
+
+function applyDueControls() {{
+  const mode = dueSortMode?.value || 'due';
+  const selectedCompany = dueCompany?.value || '';
+  const sortWithinCompanyByDue = !!dueCompanyDueToggle?.checked;
+  let items = Array.isArray(dashboardDueItems) ? [...dashboardDueItems] : [];
+
+  if (mode === 'company' && selectedCompany) {{
+    items = items.filter(item => ((item.company || 'Ohne Unternehmen').trim() || 'Ohne Unternehmen') === selectedCompany);
+  }}
+
+  if (mode === 'company') {{
+    items.sort((a, b) => {{
+      const cmp = (a.company || 'Ohne Unternehmen').localeCompare((b.company || 'Ohne Unternehmen'), 'de');
+      if (cmp !== 0) return cmp;
+      if (sortWithinCompanyByDue) {{
+        const dueCmp = dueDateValue(a.due_date) - dueDateValue(b.due_date);
+        if (dueCmp !== 0) return dueCmp;
+      }}
+      return dueStateOrder(a.state) - dueStateOrder(b.state);
+    }});
+  }} else {{
+    items.sort((a, b) => {{
+      const dueCmp = dueDateValue(a.due_date) - dueDateValue(b.due_date);
+      if (dueCmp !== 0) return dueCmp;
+      return dueStateOrder(a.state) - dueStateOrder(b.state);
+    }});
+  }}
+  updateDueControlVisibility();
+  renderDueRows(items);
+}}
+
+if (dueSortMode) dueSortMode.addEventListener('change', applyDueControls);
+if (dueCompany) dueCompany.addEventListener('change', applyDueControls);
+if (dueCompanyDueToggle) dueCompanyDueToggle.addEventListener('change', applyDueControls);
+updateCompanyOptions(dashboardDueItems);
+applyDueControls();
+
 async function refreshDashboard() {{
   try {{
     const res = await fetch('/api/live-dashboard');
@@ -1576,19 +1793,9 @@ async function refreshDashboard() {{
     setKpi('kpi-reminders', data.reminders);
     setKpi('kpi-sla', data.sla_risk_score ?? '-');
     setKpi('kpi-health', data.tenant_health ?? '-');
-    const body = document.getElementById('due-body');
-    body.innerHTML = '';
-    for (const item of data.due_inspections) {{
-      const label = item.state === 'rot' ? 'Überfällig' : item.state === 'gelb' ? 'Bald fällig' : 'OK';
-      const color = item.state === 'rot' ? '#d92d20' : item.state === 'gelb' ? '#f79009' : '#12b76a';
-      const row = document.createElement('tr');
-      row.className = 'row-enter';
-      row.innerHTML = `<td>${{item.asset}}</td><td>${{item.regulation}}</td><td>${{item.due_date}}</td><td><span style="display:inline-flex;align-items:center;gap:.35rem"><span style="width:.62rem;height:.62rem;border-radius:999px;background:${{color}};display:inline-block"></span>${{label}}</span></td>`;
-      body.appendChild(row);
-    }}
-    if (!data.due_inspections.length) {{
-      body.innerHTML = '<tr><td colspan="4">Keine Prüfpläne vorhanden.</td></tr>';
-    }}
+    dashboardDueItems = Array.isArray(data.due_inspections) ? data.due_inspections : [];
+    updateCompanyOptions(dashboardDueItems);
+    applyDueControls();
     drawBarChart('dueChart', ['Rot','Gelb','Grün'], [data.due_states.rot || 0, data.due_states.gelb || 0, data.due_states.gruen || 0], ['#d92d20','#f79009','#12b76a']);
     drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [data.invoice_states.offen || 0, data.invoice_states.teilbezahlt || 0, data.invoice_states.bezahlt || 0, data.invoice_states.ueberfaellig || 0], ['#f59e0b','#3b82f6','#22c55e','#ef4444']);
     document.getElementById('live-updated').textContent = `Letztes Update: ${{data.updated_at}}`;
@@ -1621,6 +1828,7 @@ function drawBarChart(canvasId, labels, values, colors) {{
 
 drawBarChart('dueChart', ['Rot','Gelb','Grün'], [{due_states['rot']}, {due_states['gelb']}, {due_states['gruen']}], ['#d92d20','#f79009','#12b76a']);
 drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_states['offen']}, {invoice_states['teilbezahlt']}, {invoice_states['bezahlt']}, {invoice_states['ueberfaellig']}], ['#f59e0b','#3b82f6','#22c55e','#ef4444']);
+{self.ai_script_block()}
 </script>
 """
 
@@ -1862,14 +2070,15 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
             state = status.get(asset.asset_id, {}).get("status", "active")
             if state == "archived" and not show_archived:
                 continue
+            company = getattr(asset, "company", "") or "-"
             rows.append(
-                f"<tr><td>{escape(asset.asset_id)}</td><td>{escape(asset.name)}</td><td>{escape(asset.serial_number)}</td><td>{escape(asset.location)}</td><td>{escape(asset.asset_type)}</td><td>{escape(state)}</td><td>"
+                f"<tr><td>{escape(asset.asset_id)}</td><td>{escape(asset.name)}</td><td>{escape(company)}</td><td>{escape(asset.serial_number)}</td><td>{escape(asset.location)}</td><td>{escape(asset.asset_type)}</td><td>{escape(state)}</td><td>"
                 f"<a class='tab' href='/?page=assets&edit_asset={escape(asset.asset_id)}'>Bearbeiten</a> "
                 f"<form style='display:inline' method='post' action='/asset-archive'><input type='hidden' name='asset_id' value='{escape(asset.asset_id)}'><button class='secondary' type='submit'>Archivieren</button></form> "
                 f"<form style='display:inline' method='post' action='/asset-delete'><input type='hidden' name='asset_id' value='{escape(asset.asset_id)}'><button class='secondary' type='submit'>Löschen</button></form>"
                 "</td></tr>"
             )
-        asset_rows = "".join(rows) or "<tr><td colspan='7'>Keine Anlagen vorhanden.</td></tr>"
+        asset_rows = "".join(rows) or "<tr><td colspan='8'>Keine Anlagen vorhanden.</td></tr>"
 
         plan_rows = "".join(
             f"<tr><td>{escape(plan.plan_id)}</td><td>{escape(plan.asset_id)}</td><td>{escape(plan.regulation)}</td><td>{plan.interval_days}</td></tr>"
@@ -1885,6 +2094,7 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
     {label_input('Anlagenname', 'asset_name', 'Schaltschrank A')}
     {label_input('Seriennummer', 'serial', 'SN-001')}
     {label_input('Standort', 'location', 'Werk 1')}
+    {label_input('Unternehmen', 'company', 'Muster GmbH')}
     {label_input('Anlagentyp', 'asset_type', 'Elektroanlage')}
     {label_input('Plan-ID', 'plan_id', 'p1')}
     {label_input('Regelwerk', 'regulation', 'DGUV V3')}
@@ -1899,6 +2109,7 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
     {label_input('Anlagenname', 'asset_name', 'Schaltschrank A', value=edit_asset.name if edit_asset else '')}
     {label_input('Seriennummer', 'serial', 'SN-001', value=edit_asset.serial_number if edit_asset else '')}
     {label_input('Standort', 'location', 'Werk 1', value=edit_asset.location if edit_asset else '')}
+    {label_input('Unternehmen', 'company', 'Muster GmbH', value=getattr(edit_asset, 'company', '') if edit_asset else '')}
     {label_input('Anlagentyp', 'asset_type', 'Elektroanlage', value=edit_asset.asset_type if edit_asset else '')}
     <div class='field'><button class='secondary' type='submit'>Änderungen speichern</button></div>
   </form>
@@ -1911,7 +2122,7 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   </form>
   <p><a href='/?page=assets&show_archived={1 if not show_archived else 0}'>{'Archiv anzeigen' if not show_archived else 'Archiv ausblenden'}</a></p>
 </div>
-<div class='card table-wrap'><h3>Anlagen</h3><table><tr><th>ID</th><th>Name</th><th>Seriennummer</th><th>Standort</th><th>Typ</th><th>Status</th><th>Aktionen</th></tr>{asset_rows}</table></div>
+<div class='card table-wrap'><h3>Anlagen</h3><table><tr><th>ID</th><th>Name</th><th>Unternehmen</th><th>Seriennummer</th><th>Standort</th><th>Typ</th><th>Status</th><th>Aktionen</th></tr>{asset_rows}</table></div>
 <div class='card table-wrap'><h3>Prüfpläne</h3><table><tr><th>Plan-ID</th><th>Asset-ID</th><th>Regelwerk</th><th>Intervall</th></tr>{plan_rows}</table></div>
 """
 
@@ -1984,8 +2195,8 @@ drawBarChart('invoiceChart', ['Offen','Teil','Bezahlt','Überf.'], [{invoice_sta
   </form>
   <p><button class='secondary' type='button' onclick="document.getElementById('csvExamples').showModal()">Beispiel anzeigen</button></p>
   <dialog id='csvExamples'>
-    <h4>Beispiel Assets</h4><pre>asset_id;name;serial_number;location;asset_type
-a1;Schaltschrank A;SN-001;Werk 1;Elektroanlage</pre>
+    <h4>Beispiel Assets</h4><pre>asset_id;name;serial_number;location;asset_type;company
+a1;Schaltschrank A;SN-001;Werk 1;Elektroanlage;Muster GmbH</pre>
     <h4>Beispiel Prüfpläne</h4><pre>plan_id;asset_id;regulation;interval_days
 p1;a1;DGUV V3;180</pre>
     <form method='dialog'><button>Schließen</button></form>
@@ -2081,7 +2292,7 @@ p1;a1;DGUV V3;180</pre>
             pending_box = (
                 "<div class='card'><b>Ausstehende AI-Aktion:</b> "
                 + escape(pending)
-                + "<form method='post' action='/confirm-ai-action'><button type='submit'>Aktion bestätigen</button></form></div>"
+                + "<form method='post' action='/confirm-ai-action'><input type='hidden' name='page' value='ai'><button type='submit'>Aktion bestätigen</button></form></div>"
             )
 
         return f"""
@@ -2094,6 +2305,7 @@ p1;a1;DGUV V3;180</pre>
     <button type="button" class="quick-btn" data-quick="qualitaetscheck:p1|0.21 Ohm|foto-001.jpg|M. Prüfer">Protokoll prüfen</button>
   </div>
   <form method='post' action='/ask-ai'>
+    <input type='hidden' name='page' value='ai'>
     <div class='field' style='grid-column:1/-1'>
       <label for='question'>Nachricht</label>
       <textarea id='question' name='question' placeholder='Frage oder Befehlsvorschlag eingeben…' required></textarea>
@@ -2287,6 +2499,7 @@ p1;a1;DGUV V3;180</pre>
                 if not self.require_capability("plan"):
                     self.send_error(403)
                     return
+                company = self.optional_form_value(form, "company")
                 platform.add_asset(
                     Asset(
                         form["asset_id"][0],
@@ -2294,6 +2507,7 @@ p1;a1;DGUV V3;180</pre>
                         form["serial"][0],
                         form["location"][0],
                         form["asset_type"][0],
+                        company,
                     )
                 )
                 platform.add_plan(
@@ -2308,7 +2522,7 @@ p1;a1;DGUV V3;180</pre>
                 geo_cache = load_geo_cache(cur["tenant"])
                 geo_cache.setdefault(form["asset_id"][0], {"lat": None, "lng": None, "address": form["location"][0], "updated_at": datetime.utcnow().isoformat(timespec="seconds")})
                 save_geo_cache(cur["tenant"], geo_cache)
-                write_audit(cur["tenant"], cur["user_id"], cur["role"], "add_asset_plan", {"asset_id": form["asset_id"][0]})
+                write_audit(cur["tenant"], cur["user_id"], cur["role"], "add_asset_plan", {"asset_id": form["asset_id"][0], "company": company})
 
             elif parsed.path == "/asset-update":
                 if not self.require_capability("plan"):
@@ -2318,15 +2532,16 @@ p1;a1;DGUV V3;180</pre>
                 asset = platform.assets.get(asset_id)
                 if not asset:
                     raise ValueError("Asset nicht gefunden")
-                before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type, "company": getattr(asset, "company", "")}
                 asset.name = self.safe_form_value(form, "asset_name")
                 asset.serial_number = self.safe_form_value(form, "serial")
                 new_location = self.safe_form_value(form, "location")
                 asset.asset_type = self.safe_form_value(form, "asset_type")
+                asset.company = self.optional_form_value(form, "company")
                 asset.location = new_location
                 invalidate_asset_geo_if_location_changed(cur["tenant"], asset_id, before["location"], new_location)
                 activate_asset(cur["tenant"], asset_id)
-                after = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                after = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type, "company": getattr(asset, "company", "")}
                 write_audit(cur["tenant"], cur["user_id"], cur["role"], "asset_update", {"asset_id": asset_id, "before": before, "after": after})
                 self.redirect_with_message("Anlage aktualisiert.", page_name="assets")
                 return
@@ -2353,7 +2568,7 @@ p1;a1;DGUV V3;180</pre>
                 before = None
                 if asset_id in platform.assets:
                     asset = platform.assets[asset_id]
-                    before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type}
+                    before = {"name": asset.name, "serial": asset.serial_number, "location": asset.location, "asset_type": asset.asset_type, "company": getattr(asset, "company", "")}
                     platform.assets.pop(asset_id, None)
                 status = load_asset_status(cur["tenant"])
                 status.pop(asset_id, None)
@@ -2492,7 +2707,7 @@ p1;a1;DGUV V3;180</pre>
                 asset_id = self.next_id("a", platform.assets)
                 plan_id = self.next_id("p", platform.plans)
                 platform.add_asset(
-                    Asset(asset_id, "Demo-Anlage", f"SN-{asset_id}", location, "Elektroanlage")
+                    Asset(asset_id, "Demo-Anlage", f"SN-{asset_id}", location, "Elektroanlage", "Demo GmbH")
                 )
                 platform.add_plan(InspectionPlan(plan_id, asset_id, "DGUV V3", 180))
                 write_audit(cur["tenant"], cur["user_id"], cur["role"], "quick_seed", {"asset_id": asset_id, "plan_id": plan_id})
@@ -2714,6 +2929,7 @@ p1;a1;DGUV V3;180</pre>
             
             elif parsed.path == "/ask-ai":
                 question = self.safe_form_value(form, "question").strip()
+                target_page = self.optional_form_value(form, "page", "ai")
 
                 prefix = question.split(":", 1)[0].lower()
                 command_like = (":" in question) and (prefix in AI_ACTION_PREFIXES)
@@ -2728,16 +2944,17 @@ p1;a1;DGUV V3;180</pre>
                 cur["ai_history"] = cur["ai_history"][-12:]
                 write_audit(cur["tenant"], cur["user_id"], cur["role"], "ask_ai", {"question": question[:80], "pending": command_like})
                 storage.save(cur["tenant"], platform)
-                self.redirect_with_message("AI-Nachricht verarbeitet.", page_name="ai")
+                self.redirect_with_message("AI-Nachricht verarbeitet.", page_name=target_page)
                 return
 
             elif parsed.path == "/confirm-ai-action":
                 if not self.require_capability("ai_execute"):
                     self.send_error(403)
                     return
+                target_page = self.optional_form_value(form, "page", "ai")
                 pending = cur.get("pending_ai_action", "")
                 if not pending:
-                    self.redirect_with_message("Keine AI-Aktion zur Bestätigung vorhanden.", kind="error", page_name="ai")
+                    self.redirect_with_message("Keine AI-Aktion zur Bestätigung vorhanden.", kind="error", page_name=target_page)
                     return
                 answer, changed = execute_ai_action(pending, platform, auth_data, cur["tenant"], self.next_id)
                 cur.setdefault("ai_history", []).append({"q": f"Bestätigt: {pending}", "a": answer})
@@ -2747,7 +2964,7 @@ p1;a1;DGUV V3;180</pre>
                 if changed:
                     save_auth(auth_data)
                 storage.save(cur["tenant"], platform)
-                self.redirect_with_message("AI-Aktion ausgeführt.", page_name="ai")
+                self.redirect_with_message("AI-Aktion ausgeführt.", page_name=target_page)
                 return
 
             else:
@@ -2873,10 +3090,18 @@ p1;a1;DGUV V3;180</pre>
 
 
 def run() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", 8000), Handler)
-    print("Web-Dashboard läuft auf http://localhost:8000")
+    host = (os.getenv("APP_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    port_raw = (os.getenv("APP_PORT", "8010") or "8010").strip()
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise ValueError(f"Ungueltiger APP_PORT Wert: {port_raw}") from exc
+    server = ThreadingHTTPServer((host, port), Handler)
+    shown_host = "localhost" if host in {"127.0.0.1", "0.0.0.0", "::"} else host
+    print(f"Web-Dashboard laeuft auf http://{shown_host}:{port}")
     server.serve_forever()
 
 
 if __name__ == "__main__":
     run()
+    
